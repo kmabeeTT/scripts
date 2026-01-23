@@ -153,7 +153,7 @@ def print_summary_table(graphs, output_dir):
     print("\n" + "=" * 100)
     print("EXTRACTED GRAPHS SUMMARY")
     print("=" * 100)
-    print(f"{'Graph':^8} {'IR Type':^18} {'Lines':>8} {'Ops':>8} {'Output File':^60}")
+    print(f"{'Graph':<8} {'IR Type':<18} {'Lines':>8} {'Ops':>8}   {'Output File':<60}")
     print("-" * 100)
 
     for graph_num in sorted(by_graph_num.keys()):
@@ -161,7 +161,7 @@ def print_summary_table(graphs, output_dir):
             type_name = graph.ir_type.replace('_', '')
             filename = f"graph_{graph.graph_num}_{type_name}.mlir"
             filepath = Path(output_dir) / filename
-            print(f"{graph.graph_num:^8} {graph.ir_type:^18} {graph.line_count:>8} {graph.op_count:>8}   {filepath}")
+            print(f"{graph.graph_num:<8} {graph.ir_type:<18} {graph.line_count:>8} {graph.op_count:>8}   {filepath}")
 
     print("-" * 100)
 

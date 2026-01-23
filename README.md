@@ -37,16 +37,22 @@ python analyze_failure.py <log_file> [-o report.txt]
 
 ---
 
-### 📦 extract_ttir_graph.py
-**Extract TTIR graph from debug log**
+### 📦 extract_mlir_graphs.py
+**Extract MLIR graphs from debug log**
 
 ```bash
-python extract_ttir_graph.py <log_file> -o ttir.mlir
+python extract_mlir_graphs.py <log_file> [--type ttir|ttnn|all]
 ```
 
-**Output**: Complete TTIR graph in MLIR format.
+**Output**: MLIR graphs (VHLO, StableHLO, TTIR, TTNN) written to /tmp/ with summary table.
 
-**Use when**: You need to analyze the high-level IR representation to understand operation decomposition.
+**Use when**: You need to extract and analyze IR representations at various compilation stages.
+
+**Features**:
+- Extract specific IR types or all types
+- Filter by TTNN operation patterns
+- Multiple graph support
+- Summary table with statistics
 
 ---
 
@@ -68,15 +74,22 @@ python show_mlir_modules.py test_debug.log
 python analyze_failure.py test_debug.log
 ```
 
-### 4. Extract TTIR (if needed)
+### 4. Extract MLIR Graphs (if needed)
 ```bash
-python extract_ttir_graph.py test_debug.log -o ttir.mlir
+# Extract TTIR (default)
+python extract_mlir_graphs.py test_debug.log
+
+# Extract all IR types
+python extract_mlir_graphs.py test_debug.log --type all
+
+# Filter by operation
+python extract_mlir_graphs.py test_debug.log --filter 'ttnn.rms_norm'
 ```
 
-### 5. Search for Specific Operations
+### 5. Search in Extracted Graphs
 ```bash
-grep 'multiply.362' ttir.mlir
-grep -c '"ttir\.' ttir.mlir
+grep 'multiply.362' /tmp/graph_1_ttir.mlir
+grep -c '"ttir\.' /tmp/graph_1_ttir.mlir
 ```
 
 ---
@@ -114,15 +127,23 @@ Line: 63691
 Error: circular buffers grow to 1528960 B which is beyond max L1 size of 1499136 B
 ```
 
-### Example 3: Extracting TTIR
+### Example 3: Extracting MLIR Graphs
 ```bash
-$ python extract_ttir_graph.py test_qwen3_embedding.log -o ttir.mlir
+$ python extract_mlir_graphs.py test_qwen3_embedding.log --type all
 
-✓ TTIR module at line 40351 (4942 operations, 9887 lines)
-✅ Found TTIR graph (simplified log format)
-✅ TTIR graph written to: ttir.mlir
+====================================================================================================
+EXTRACTED GRAPHS SUMMARY
+====================================================================================================
+Graph    IR Type              Lines      Ops   Output File
+----------------------------------------------------------------------------------------------------
+1        vhlo                 10903    39969   /tmp/graph_1_vhlo.mlir
+1        shlo                 10178     5091   /tmp/graph_1_shlo.mlir
+1        ttir                  9887     4942   /tmp/graph_1_ttir.mlir
+1        ttnn                 13724     4319   /tmp/graph_1_ttnn.mlir
+----------------------------------------------------------------------------------------------------
+Total: 1 graph(s), 6 IR representation(s), 63,917 operations, 63,877 lines
 
-$ grep 'multiply.362' ttir.mlir
+$ grep 'multiply.362' /tmp/graph_1_ttir.mlir
 %144 = "ttir.multiply"(%139, %143) : (tensor<1x32x4096xbf16>, ...) loc(#loc419)
 ```
 
@@ -158,7 +179,7 @@ All scripts provide helpful feedback:
 
 ## Common Issues
 
-### Issue: "No TTIR graph found"
+### Issue: "No MLIR Module markers found"
 
 **Cause**: IR dumps not enabled in log.
 
@@ -174,7 +195,7 @@ pytest <your_test> -v -s 2>&1 | tee test_debug.log
 
 **Solution**: Verify the test actually failed by checking exit code or test output.
 
-### Issue: Extracted TTIR seems incomplete
+### Issue: Extracted graphs seem incomplete
 
 **Cause**: Log was truncated or captured incorrectly.
 
@@ -211,18 +232,8 @@ All scripts support `--help`:
 ```bash
 python show_mlir_modules.py --help
 python analyze_failure.py --help
-python extract_ttir_graph.py --help
+python extract_mlir_graphs.py --help
 ```
-
----
-
-## Documentation
-
-For more detailed information, see:
-
-- **`../../DEBUG_LOG_ANALYSIS_GUIDE.md`**: Complete workflow guide
-- **`../../TTIR_EXTRACTION_SUCCESS.md`**: TTIR extraction examples
-- **`../../SCRIPT_IMPROVEMENTS_SUMMARY.md`**: Script update history
 
 ---
 
