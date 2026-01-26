@@ -53,9 +53,7 @@ class MLIRGraph:
 
     def write_to_file(self, output_dir):
         """Write graph to file."""
-        # Normalize type name for filename
-        type_name = self.ir_type.replace('_', '')
-        filename = f"graph_{self.graph_num}_{type_name}.mlir"
+        filename = f"graph_{self.graph_num}_{self.ir_type}.mlir"
         filepath = Path(output_dir) / filename
 
         with open(filepath, 'w') as f:
@@ -155,8 +153,7 @@ def print_summary_table(graphs, output_dir):
 
     for graph_num in sorted(by_graph_num.keys()):
         for graph in sorted(by_graph_num[graph_num], key=lambda g: ['vhlo', 'shlo', 'shlo_frontend', 'shlo_compiler', 'ttir', 'ttnn'].index(g.ir_type) if g.ir_type in ['vhlo', 'shlo', 'shlo_frontend', 'shlo_compiler', 'ttir', 'ttnn'] else 99):
-            type_name = graph.ir_type.replace('_', '')
-            filename = f"graph_{graph.graph_num}_{type_name}.mlir"
+            filename = f"graph_{graph.graph_num}_{graph.ir_type}.mlir"
             filepath = Path(output_dir) / filename
             print(f"{graph.graph_num:<8} {graph.ir_type:<18} {graph.line_count:>8} {graph.op_count:>8}   {filepath}")
 
