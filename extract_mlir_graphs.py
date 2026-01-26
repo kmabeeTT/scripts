@@ -96,12 +96,15 @@ def parse_mlir_modules(log_file):
 
         # Determine content boundaries
         start_line = line_num + 1  # Skip marker line
-        if idx + 1 < len(mlir_markers):
-            end_line = mlir_markers[idx + 1][0]
-        else:
-            end_line = len(lines)
 
-        # Extract content
+        # Find the END OF MLIR MODULE marker
+        end_line = len(lines)  # Default to end of file
+        for i in range(start_line, len(lines)):
+            if 'END OF MLIR MODULE' in lines[i]:
+                end_line = i  # Stop before the END marker
+                break
+
+        # Extract content (excluding the END marker line)
         content = ''.join(lines[start_line:end_line])
 
         # Create graph object
@@ -249,6 +252,10 @@ Examples:
 
   # Custom output directory
   python extract_ttir_graph.py test_debug.log --output-dir /my/path
+
+  # Use subdirectory to prevent overwrites
+  python extract_ttir_graph.py test_debug.log --type all --subdir run1
+  python extract_ttir_graph.py test_debug.log --type all --subdir run2
         """
     )
 
@@ -273,6 +280,11 @@ Examples:
         help='Output directory for extracted graphs (default: /tmp)'
     )
 
+    parser.add_argument(
+        '--subdir', '-s',
+        help='Optional subdirectory name under output-dir to prevent overwrites'
+    )
+
     args = parser.parse_args()
 
     # Validate log file
@@ -283,11 +295,16 @@ Examples:
     # Default to ttir if no type specified
     graph_types = args.types if args.types else ['ttir']
 
+    # Determine output directory
+    output_dir = args.output_dir
+    if args.subdir:
+        output_dir = str(Path(args.output_dir) / args.subdir)
+
     # Extract graphs
     result = extract_graphs(
         args.log_file,
         graph_types,
-        args.output_dir,
+        output_dir,
         args.filter
     )
 
