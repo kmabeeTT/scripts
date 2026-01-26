@@ -76,6 +76,39 @@ python compare_mlir.py <file1.mlir> <file2.mlir> [--diff]
 
 ---
 
+### ⚙️ print_ttir_to_ttnn_options.py
+**Generate ttmlir-opt pipeline options for manual TTIR-to-TTNN conversion**
+
+```bash
+python print_ttir_to_ttnn_options.py <system_desc.ttsys> [options]
+```
+
+**Output**: Complete ttmlir-opt command with properly formatted pipeline options.
+
+**Use when**: You need to manually run TTIR-to-TTNN conversion with the same options that TT-XLA would use.
+
+**Options**:
+- `--bfp8-weights`: Enable experimental BFP8 weight conversion
+- `--bfp8-activations`: Enable BFP8 conversion for activations
+- `-O [0,1,2]`: Optimization level (0=disabled, 1=optimizer, 2=optimizer+sharding)
+- `--math-fidelity [lofi|hifi2|hifi3|hifi4]`: Math fidelity setting (default: hifi4)
+- `--no-fp32-dest-acc`: Disable FP32 destination accumulation
+- `--trace`: Enable trace optimization
+- `--no-const-eval`: Disable constant evaluation
+- `--mesh-shape`: Device mesh shape (default: 1,1)
+
+**Example**:
+```bash
+# With BFP8 weights and optimizer enabled
+python print_ttir_to_ttnn_options.py ttrt-artifacts/system_desc.ttsys --bfp8-weights -O1
+
+# Output:
+# ttmlir-opt --ttir-to-ttnn-backend-pipeline="system-desc-path=... experimental-bfp8-weights=true ..." \
+#   -o output.mlir input.mlir
+```
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
