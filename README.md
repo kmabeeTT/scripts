@@ -56,6 +56,26 @@ python extract_mlir_graphs.py <log_file> [--type ttir|ttnn|all]
 
 ---
 
+### 🔄 compare_mlir.py
+**Compare two MLIR files for functional equivalence**
+
+```bash
+python compare_mlir.py <file1.mlir> <file2.mlir> [--diff]
+```
+
+**Output**: Comparison report showing if files are functionally equivalent, with normalized files saved to /tmp.
+
+**Use when**: You need to verify that two MLIR IR files represent the same computation graph, ignoring location attributes.
+
+**Features**:
+- Strips location attributes for comparison
+- Compares operation types and counts
+- Verifies function signatures
+- Auto-saves normalized files for manual inspection
+- Provides ready-to-use diff commands
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
