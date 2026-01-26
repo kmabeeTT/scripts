@@ -84,21 +84,15 @@ def parse_mlir_modules(log_file):
         return []
 
     # Group modules into graphs
-    # Each compilation produces a sequence of modules
-    # We detect a new graph when we see 'vhlo' or when the sequence repeats
+    # Each compilation produces a sequence: vhlo -> shlo variants -> ttir -> ttnn
+    # New graph starts when we see 'vhlo' again
     graphs = []
     graph_num = 1
 
     for idx, (line_num, module_type) in enumerate(mlir_markers):
-        # Check if this is the start of a new graph
+        # New graph starts when we see vhlo (except for the first one)
         if module_type == 'vhlo' and idx > 0:
             graph_num += 1
-        elif idx > 0:
-            # Check if we're seeing a module type we've already seen in this graph
-            # This indicates a new graph starting without vhlo marker
-            prev_types = [mlir_markers[i][1] for i in range(max(0, idx - 6), idx)]
-            if module_type in prev_types:
-                graph_num += 1
 
         # Determine content boundaries
         start_line = line_num + 1  # Skip marker line
