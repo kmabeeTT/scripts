@@ -109,6 +109,39 @@ python print_ttir_to_ttnn_options.py ttrt-artifacts/system_desc.ttsys --bfp8-wei
 
 ---
 
+### 🐳 find_docker_tags.py
+**Find all registry tags pointing to the same digest as a local Docker image**
+
+```bash
+python find_docker_tags.py <image>
+```
+
+**Output**: All registry tags (e.g. `dt-*`) that resolve to the same manifest digest as the locally pulled image.
+
+**Use when**: You want to know which `dt-` tag (or any other tag) corresponds to a Docker image you have locally, since `docker inspect` only shows the tag you pulled with (e.g. `latest`).
+
+**Example**:
+```bash
+$ python find_docker_tags.py ghcr.io/tenstorrent/tt-xla/tt-xla-ird-ubuntu-24-04:latest
+
+Inspecting local image: ghcr.io/tenstorrent/tt-xla/tt-xla-ird-ubuntu-24-04:latest
+Registry:     ghcr.io
+Repository:   tenstorrent/tt-xla/tt-xla-ird-ubuntu-24-04
+Digest:       sha256:ea054b08...
+Checking 31 tags...
+
+Tags pointing to sha256:ea054b08...:
+  dt-b5e301d886ca68a24cde226793ed46a2f0e7097ae2ffd688835764bcc46ae5d5
+  dt-72057613073a334abadf8709b0793656b030eb15904942b8940f1ff96486ea40
+```
+
+**Notes**:
+- Works with any OCI-compliant registry that supports anonymous pulls (ghcr.io, Docker Hub, etc.)
+- Requires the image to be pulled locally (`docker pull <image>` first)
+- Does not work for locally built images (no RepoDigest)
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
