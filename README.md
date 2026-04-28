@@ -142,6 +142,31 @@ Tags pointing to sha256:ea054b08...:
 
 ---
 
+### 📥 rsync_remote.py
+**Pull a remote directory into the current directory via rsync**
+
+```bash
+python rsync_remote.py <remote_path> [--host HOST] [--user USER] [--strip PREFIX] [--dest DIR] [--dry-run] [--no-compress]
+```
+
+**Output**: Files synced to `./<remote_path with --strip removed>/` (or `--dest` if given), using `rsync -avhz --partial --info=progress2`.
+
+**Use when**: You need to grab profiler artifacts (`.tracy`, `profile_log_device.csv`, `ops_perf_results_*.csv`, etc.) or any directory off a remote dev machine quickly.
+
+**Defaults**:
+- `--host`: `10.32.48.16`
+- `--user`: `$USER`
+- `--strip`: `~/kmabee_demo/tt-xla-2/` (everything after this becomes the local path)
+
+**Example**:
+```bash
+# Remote: ~/kmabee_demo/tt-xla-2/tracy_sampler_nongreedy_tt_sampling_pad32_batch2/reports/2026_04_28_18_26_05
+# Local:  ./tracy_sampler_nongreedy_tt_sampling_pad32_batch2/reports/2026_04_28_18_26_05/
+python rsync_remote.py ~/kmabee_demo/tt-xla-2/tracy_sampler_nongreedy_tt_sampling_pad32_batch2/reports/2026_04_28_18_26_05
+```
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
