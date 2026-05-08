@@ -167,6 +167,50 @@ python rsync_remote.py ~/kmabee_demo/tt-xla-2/tracy_sampler_nongreedy_tt_samplin
 
 ---
 
+### 🤖 test_llm_server.sh
+**Smoke-test a running LLM inference server (vLLM- or media-forge-style)**
+
+```bash
+./test_llm_server.sh
+HOST=qb2-120-p01t06 PORT=8010 ./test_llm_server.sh
+API_KEY=xxx ./test_llm_server.sh
+MODEL=meta-llama/Llama-3.2-1B-Instruct ./test_llm_server.sh
+```
+
+**Output**: Hits `/health`, `/v1/models`, then runs both `/v1/chat/completions` and `/v1/completions` with a known prompt and prints the JSON response.
+
+**Use when**: You've launched an LLM server (via `run.py --docker-server`, manually via uvicorn, etc.) and want a one-shot end-to-end check that the routes are wired up and the model returns coherent output.
+
+**Defaults**:
+- `HOST=localhost`, `PORT=8000`
+- Auto-discovers the model id from `/v1/models` (override with `MODEL=...`).
+- `API_KEY=your-secret-key` — matches the tt-media-server's container default fallback. Override if you set a real key in the server's env.
+
+---
+
+### 🖼️ test_cnn_server.sh
+**Smoke-test a running CNN inference server (e.g. resnet-50)**
+
+```bash
+./test_cnn_server.sh
+HOST=qb2-120-p01t06 PORT=8010 ./test_cnn_server.sh
+IMAGE=/path/to/pic.jpg ./test_cnn_server.sh
+```
+
+**Output**: Hits `/health`, `/v1/models`, then `POST /v1/cnn/search-image` with a sample image, prints the top-K classification labels and confidences.
+
+**Use when**: You've launched a CNN server (resnet-50, vovnet, mobilenetv2, etc. via tt-media-server) and want to verify it's actually classifying images correctly, not just responding to health checks.
+
+**Defaults**:
+- `HOST=localhost`, `PORT=8010`
+- Auto-downloads PyTorch's canonical `dog.jpg` (a Samoyed) to `/tmp/tt_test_dog.jpg` if `IMAGE=` isn't set. Should classify at >90% confidence as "Samoyed, Samoyede".
+- `API_KEY=your-secret-key` (same default as the LLM script).
+- `top_k=5`, `min_confidence=10.0`.
+
+**Note**: `/v1/models` returns an empty `data` list for CNN services — that's expected; the model id isn't surfaced via that endpoint for CNN runners. The classification call is the real test.
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
