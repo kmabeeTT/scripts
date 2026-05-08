@@ -188,6 +188,49 @@ MODEL=meta-llama/Llama-3.2-1B-Instruct ./test_llm_server.sh
 
 ---
 
+### 💬 client_demo.sh
+**Interactive chat client with multi-turn conversation against a running LLM server**
+
+```bash
+./client_demo.sh                        # default max_tokens=128
+./client_demo.sh 256                    # max_tokens=256
+PORT=8000 ./client_demo.sh
+TEMPERATURE=0.8 REPETITION_PENALTY=1.1 ./client_demo.sh
+```
+
+**Output**: Prompt loop. Each turn streams the assistant response and prints `[N tokens | TTFT: Xms | Ys | tok/s | in:N out:N]` after completion. Conversation history is preserved across turns; type `new` to reset, `q` to quit.
+
+**Use when**: You want to manually exercise a deployed LLM server (vLLM- or media-forge-style) for behavior testing — checking coherence, output length, or multi-turn context handling. Complements `test_llm_server.sh` which is one-shot.
+
+**Defaults**:
+- `PORT=8000`, `SERVER=http://localhost:$PORT`
+- Auto-discovers model id from `/v1/models`.
+- `API_KEY=your-secret-key`.
+- Optional sampling overrides via `TEMPERATURE=` and `REPETITION_PENALTY=` env vars (uses server defaults if unset).
+
+---
+
+### 🚀 client_demo_concurrent.sh
+**Multi-stream concurrent client — fire N parallel chat requests with the same prompt**
+
+```bash
+./client_demo_concurrent.sh              # 2 concurrent streams, max_tokens=128
+./client_demo_concurrent.sh 4 256        # 4 concurrent streams, max_tokens=256
+./client_demo_concurrent.sh 8 128 0.5    # 8 streams with 0.5s stagger between each start
+PORT=8000 ./client_demo_concurrent.sh 16
+```
+
+**Output**: Each prompt fires N requests in parallel; the screen redraws N lines in place as each stream's text arrives. After all complete, prints per-stream metrics (`tokens | TTFT | elapsed | tok/s`) and total wall time.
+
+**Use when**: You want to exercise the server's concurrency handling (vLLM batching, scheduler behavior under load) and see realistic per-user TTFT / throughput when N users are hitting the same prompt at once. Useful for batch-size scaling validation and sanity-checking multi-tenant performance.
+
+**Defaults**:
+- Args: `N=2 MAX_TOKENS=128 STAGGER=0` (positional).
+- `STAGGER=<seconds>` delays the start of each subsequent stream by `STAGGER × idx` seconds — useful for staggered-arrival simulations.
+- Server / auth env vars same as `client_demo.sh`.
+
+---
+
 ### 🖼️ test_cnn_server.sh
 **Smoke-test a running CNN inference server (e.g. resnet-50)**
 
