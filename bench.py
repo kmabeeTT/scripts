@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Benchmark all running inference servers on ports 8000-8003.
+Benchmark running inference servers across one or more ports.
 Measures tok/s and TTFT across prompt/output length configurations.
 
 Usage:
-    python3 bench.py                  # fast mode, localhost
-    python3 bench.py --full           # exhaustive mode, localhost
-    python3 bench.py --remote         # fast mode, 10.32.48.16
-    python3 bench.py --full --remote  # exhaustive mode, 10.32.48.16
-    python3 bench.py --host 1.2.3.4   # custom host
+    python3 bench.py                                   # fast mode, default ports 8000-8003
+    python3 bench.py 8100 8101 8102 8103               # custom port list (positional)
+    python3 bench.py --full                            # exhaustive mode, default ports
+    python3 bench.py --full 8100 8101 8102 8103        # exhaustive, custom ports
+    python3 bench.py --remote 8000 8001                # remote host, custom ports
+    python3 bench.py --host 1.2.3.4 8100 8101          # custom host + ports
 """
 import argparse
 import json
@@ -20,7 +21,7 @@ import time
 
 import requests
 
-PORTS = [8000, 8001, 8002, 8003]
+DEFAULT_PORTS = [8000, 8001, 8002, 8003]
 DEFAULT_HOST = "localhost"
 REMOTE_HOST = "10.32.48.16"
 
@@ -71,7 +72,7 @@ def run_request(host, port, model, prompt, max_tokens, headers):
         for line in r.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
                 continue
-            data = line.removeprefix("data: ")
+            data = line[len("data: "):]   # avoid str.removeprefix (Python 3.9+)
             if data.strip() == "[DONE]":
                 break
             chunk = json.loads(data)
@@ -92,9 +93,14 @@ def main():
     parser.add_argument("--full", action="store_true", help="Exhaustive mode (more configs, more reps)")
     parser.add_argument("--remote", action="store_true", help=f"Use remote host {REMOTE_HOST}")
     parser.add_argument("--host", default=None, help="Custom host IP (overrides --remote)")
+    parser.add_argument(
+        "ports", nargs="*", type=int, metavar="PORT",
+        help=f"Ports to benchmark (default: {' '.join(str(p) for p in DEFAULT_PORTS)})",
+    )
     args = parser.parse_args()
 
     host = args.host or (REMOTE_HOST if args.remote else DEFAULT_HOST)
+    ports = args.ports if args.ports else DEFAULT_PORTS
     api_key = os.environ.get("API_KEY", "your-secret-key")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -103,9 +109,9 @@ def main():
     mode_str = f"FULL ({n_reps} reps)" if args.full else f"FAST ({n_reps} reps)"
 
     # Discover active servers
-    print(f"Scanning {host} ports {PORTS[0]}-{PORTS[-1]}...")
+    print(f"Scanning {host} ports {' '.join(str(p) for p in ports)}...")
     servers = {}
-    for p in PORTS:
+    for p in ports:
         m = check_server(host, p, headers)
         status = f"{m} ✓" if m else "not ready"
         print(f"  port {p}: {status}")
