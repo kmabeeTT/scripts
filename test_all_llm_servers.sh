@@ -66,11 +66,15 @@ if [[ "$HEALTH_ONLY" -eq 1 ]]; then
     IFS='|' read -r cid name port <<< "$entry"
     code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
       "http://${HOST}:${port}/health" 2>/dev/null)
+    # /v1/models returns 200 even during warmup; use it to get the model id.
+    model=$(curl -s --max-time 3 "http://${HOST}:${port}/v1/models" 2>/dev/null \
+      | jq -r '.data[0].id // empty' 2>/dev/null)
+    [[ -z "$model" ]] && model="?"
     if [[ "$code" == "200" ]]; then
-      echo "[$name] port $port: READY"
+      echo "[$name] port $port: READY ($model)"
       ready=$((ready+1))
     else
-      echo "[$name] port $port: warming ($code)"
+      echo "[$name] port $port: warming ($code) ($model)"
       warming=$((warming+1))
     fi
   done
