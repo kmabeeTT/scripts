@@ -4,6 +4,7 @@
 #
 # Usage:
 #   ./test_all_llm_servers.sh              # localhost, default API key
+#   ./test_all_llm_servers.sh --health     # only report /health readiness (READY / warming)
 #   HOST=foo ./test_all_llm_servers.sh     # remote host
 #   API_KEY=xxx ./test_all_llm_servers.sh
 #
@@ -13,13 +14,21 @@
 # - Skips containers that don't respond healthy on /health (still warming up
 #   or already crashed).
 # - Skips containers whose /v1/models returns no entries (e.g. CNN servers).
+# - --health mode reports per-port readiness without sending any tokens or
+#   invoking test_llm_server.sh. /health returns 200 once the model is loaded
+#   and serving; 405 (or other non-200) while still warming up.
 
 set -u
+
+HEALTH_ONLY=0
+if [[ "${1:-}" == "--health" ]]; then
+  HEALTH_ONLY=1
+fi
 
 HOST="${HOST:-localhost}"
 TEST_SCRIPT="$(dirname "$0")/test_llm_server.sh"
 
-if [[ ! -x "$TEST_SCRIPT" ]]; then
+if [[ "$HEALTH_ONLY" -eq 0 && ! -x "$TEST_SCRIPT" ]]; then
   echo "ERROR: $TEST_SCRIPT not found or not executable" >&2
   exit 1
 fi
@@ -49,6 +58,27 @@ fi
 echo "Found ${#entries[@]} tt-inference-server container(s):"
 printf '%s\n' "${entries[@]}" | awk -F'|' '{printf "  - %s (port %s) [%s]\n", $2, $3, $1}'
 echo
+
+if [[ "$HEALTH_ONLY" -eq 1 ]]; then
+  ready=0
+  warming=0
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r cid name port <<< "$entry"
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 \
+      "http://${HOST}:${port}/health" 2>/dev/null)
+    if [[ "$code" == "200" ]]; then
+      echo "[$name] port $port: READY"
+      ready=$((ready+1))
+    else
+      echo "[$name] port $port: warming ($code)"
+      warming=$((warming+1))
+    fi
+  done
+  echo
+  echo "Health summary: $ready ready, $warming warming (out of ${#entries[@]} container(s))"
+  [[ $warming -eq 0 ]]
+  exit
+fi
 
 pass=0
 fail=0
