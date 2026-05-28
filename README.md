@@ -254,6 +254,50 @@ IMAGE=/path/to/pic.jpg ./test_cnn_server.sh
 
 ---
 
+### 📐 kv_cache_estimator.py
+**Estimate on-device DRAM usage (weights + KV pool + activations) for a forge LLM serving config**
+
+```bash
+# Default sweep matrix (batch_size × max_seq_len) for one of the 5 forge LLMs
+python kv_cache_estimator.py --model Falcon3-7B-Instruct
+python kv_cache_estimator.py --model Llama-3.1-8B-Instruct
+python kv_cache_estimator.py --model Llama-3.2-3B-Instruct
+python kv_cache_estimator.py --model Qwen3-4B
+python kv_cache_estimator.py --model Qwen3-8B
+
+# Detail breakdown for one specific config (the v3/v4 known-working point)
+python kv_cache_estimator.py --model Llama-3.1-8B-Instruct \
+    --batch-size 4 --seq-len 16384 --max-concurrency 4
+
+# Custom sweep grid
+python kv_cache_estimator.py --model Qwen3-8B \
+    --batch-sizes 1,2,4,8,16 --seq-lens 2048,4096,8192,16384,32768
+
+# Different device (e.g. N300 ~24 GB DRAM)
+python kv_cache_estimator.py --model Llama-3.2-3B-Instruct --dram-gb 24
+```
+
+**Output**: Three tables in matrix mode:
+1. **Total DRAM (GB)** per (batch, seq) — ✅ fits, ❌ exceeds
+2. **vLLM Maximum-concurrency Nx** (`pool / (seq × KV/tok)`) — flags ⚠ when below batch_size (preemption expected)
+3. **Suggested GPU_MEMORY_UTILIZATION** to use with vLLM (= KV pool / device DRAM, rounded up)
+
+Detail mode adds per-component breakdown (weights, KV pool, activations heuristic) + the exact `TT_KV_POOL_GB=<dram_gb> + GPU_MEMORY_UTILIZATION=<value>` env-var combo to pass under today's tt-inference-server stack.
+
+**Use when**: Choosing between high-batch-low-seq vs low-batch-high-seq for a config you're about to launch, or sanity-checking whether a `(b, seq)` combo will OOM before committing to a 15+ min server warmup. Especially helpful for the `b × seq = 128K` regime on P150 where Llama-3.1-8B starts hitting allocator fragmentation walls.
+
+**Knobs**:
+- `--max-concurrency N` — upper bound on simultaneous full-length seqs in the KV pool. Effective value is `min(max_concurrency, batch_size)` — setting above `batch_size` is capped (no waste). Default 1 = minimal pool, vLLM preempts at runtime when more than 1 full-length seq is active. Set equal to `batch_size` for full-length steady-state with no preemption.
+- `--weight-dtype {bf16,bfp8}` — default `bfp8`. If forge actually keeps weights at `bf16` on-device (uncertain), flip and rows shift ~8 GB toward "doesn't fit".
+- `--activation-layers N` — heuristic # of intermediate buffers live at once (default 10, calibrated to the `b×seq=128K` Llama-3.1-8B OOM).
+- `--dram-gb N` — device DRAM budget (default 32 for P150).
+
+**Limitations**:
+- Activation estimate is heuristic; doesn't model tt-metal allocator fragmentation (two configs at the same predicted total can have different real-world fits if one needs a bigger single tensor).
+- Per-token KV assumes vLLM's default bfloat16 KV cache dtype.
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
