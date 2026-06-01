@@ -335,6 +335,41 @@ tt-metal  2026-05-19 (c5ebc6351) by GitHub (Author onenezic@tenstorrent.com) : [
 
 ---
 
+### 🚗 decode_roofline.py
+**Estimate roofline decode throughput (tok/sec) for an LLM on single-chip Wormhole (n150) and Blackhole (p150)**
+
+```bash
+./decode_roofline.py                 # table for 3B, 7B, 8B, 11B
+./decode_roofline.py 8               # single 8B model
+./decode_roofline.py 70 --dtype bfp4 # large/MoE models in bfp4
+./decode_roofline.py 8 --wh-bw 336   # Galaxy WH bandwidth
+./decode_roofline.py 8 --efficiency 0.65
+```
+
+**Output**: 3-column table (`params`, `wh tok/s`, `bh tok/s`).
+
+**Use when**: You want a quick back-of-envelope decode tok/sec ceiling for a model before benchmarking. Decode (batch=1) is DRAM-bandwidth bound — every weight is streamed from DRAM once per token — so `tok/sec = bandwidth / model_size × efficiency`.
+
+**Defaults** (per Ognjen Djuricic's compiler-pass formula):
+- Weights stored in `bfp8` = 1.03125 bytes/param (8.25 bits: blocks of 32 sharing an 8-bit exponent).
+- `--wh-bw 288` (n150), `--bh-bw 512` (p150) GB/s; `--efficiency 0.7`.
+
+**Knobs**:
+- `--dtype {bfp4,bfp8,fp8,bf16,fp16,fp32}` — on-device weight format (bfp4 ≈ half the size, ~2× tok/s; use for large/MoE models).
+- `--bytes-per-param N` — override bytes/param directly (takes precedence over `--dtype`).
+- `--efficiency N` — achievable fraction of peak DRAM bandwidth.
+- `--wh-bw N` / `--bh-bw N` — override per-chip DRAM bandwidth (e.g. `--wh-bw 336` for a Galaxy WH chip).
+
+**Example**:
+```bash
+$ ./decode_roofline.py 8
+  params   wh tok/s   bh tok/s
+-------- ---------- ----------
+      8B       24.4       43.4
+```
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
