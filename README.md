@@ -298,6 +298,43 @@ Detail mode adds per-component breakdown (weights, KV pool, activations heuristi
 
 ---
 
+### 🔖 tt_forge_commits.sh
+**Show the tt-xla / tt-mlir / tt-metal commits baked into a tt-forge wheel (no full download by default)**
+
+```bash
+./tt_forge_commits.sh 1.2.0                                   # version / tag
+./tt_forge_commits.sh https://github.com/tenstorrent/tt-forge/releases/tag/1.2.0
+./tt_forge_commits.sh 1.2.0.dev20260526002843                 # dev wheel
+./tt_forge_commits.sh --download 1.2.0                        # full pip download instead
+./tt_forge_commits.sh /path/to/pjrt_plugin_tt-*.whl           # local wheel
+```
+
+**Output**: For the given tt-forge version, prints each component commit as a one-line git-log entry (`%cd (%h) by %cn (Author %ae) : %s`, `--date=short`) by querying the component repo via `gh`, plus the `built-date`.
+
+**Use when**: You need the exact tt-xla / tt-mlir / tt-metal commits for a tt-forge release — e.g. to bisect a regression across wheel versions or for reproducibility. The release page doesn't expose this; it lives only in the `pjrt-plugin-tt` wheel's METADATA `Summary` field.
+
+**How it reads metadata** (default = no full download):
+1. PEP 658 `<wheel>.metadata` sidecar — one tiny GET, when the index serves it.
+2. HTTP range requests over the wheel zip's METADATA member (~1% of the ~130 MB wheel) — current fallback.
+3. `--download` forces a full `pip download` of the wheel.
+
+**Requires**: `gh` (authenticated) + `python3`; `--download` additionally needs `pip` (reaching the eng index) + `unzip`.
+
+**Env**:
+- `TTPYPI_INDEX` — package index (default `https://pypi.eng.aws.tenstorrent.com`)
+- `PIP` — pip to use for `--download` (default `pip3`)
+
+**Example**:
+```bash
+$ ./tt_forge_commits.sh 1.2.0
+built-date: 2026-05-23
+tt-xla    2026-05-23 (347190144) by GitHub (Author 157983820+vmilosevic@...) : Uplift third_party/tt_forge_models to 7201811e... (#4882)
+tt-mlir   2026-05-19 (2bd670184) by GitHub (Author sshon@tenstorrent.com) : PagedSdpaDecode: workaround pass attribute for large head_dim (#8384)
+tt-metal  2026-05-19 (c5ebc6351) by GitHub (Author onenezic@tenstorrent.com) : [tt-triage] Save LLM friendly output artifact in CI (#44609)
+```
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
