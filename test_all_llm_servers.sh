@@ -11,6 +11,13 @@
 #                                                                   # prompt: "Tell me a quick story".
 #   ./test_all_llm_servers.sh --concurrent 4 "Write a haiku"        # custom prompt
 #   ./test_all_llm_servers.sh --concurrent 4 --max-tokens 64        # longer outputs
+#   ./test_all_llm_servers.sh --concurrent 1 --seq                  # one server at a
+#                                                                   # time (no cross-server
+#                                                                   # host-CPU contention)
+#   ./test_all_llm_servers.sh --concurrent 1 --ports 8101,8102      # use explicit ports
+#                                                                   # instead of docker
+#                                                                   # discovery (models found
+#                                                                   # via /v1/models)
 #   ./test_all_llm_servers.sh --concurrent 4 --max-tokens 64 "..."  # both
 #   HOST=foo ./test_all_llm_servers.sh
 #   API_KEY=xxx ./test_all_llm_servers.sh
@@ -36,6 +43,8 @@ HEALTH_ONLY=0
 CONCURRENT_N=0
 PROMPT_TEXT=""
 MAX_TOKENS=32
+SEQ=0
+PORTS_CSV=""
 
 # Parse args. Recognized flags: --health | --concurrent N | --max-tokens N.
 # A bare positional (no leading --) is taken as the prompt text and only makes
@@ -61,9 +70,26 @@ while [[ $# -gt 0 ]]; do
       fi
       MAX_TOKENS="$1"
       shift ;;
+    --seq)
+      # Concurrent mode only: run servers ONE AT A TIME (each server's N
+      # streams still run together), so cross-server host-CPU contention
+      # (cpu_sampling runs on the host) doesn't depress each server's tok/s.
+      SEQ=1
+      shift ;;
+    --ports)
+      # Use explicit, comma-separated host ports instead of discovering
+      # docker containers (e.g. --ports 8101,8102). Works for non-container
+      # servers too; the model on each port is discovered via /v1/models.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "ERROR: --ports requires comma-separated port numbers (e.g. --ports 8101,8102)" >&2
+        exit 2
+      fi
+      PORTS_CSV="$1"
+      shift ;;
     --*)
       echo "ERROR: unknown flag: $1" >&2
-      echo "Usage: $0 [--health | --concurrent N [--max-tokens N] [PROMPT]]" >&2
+      echo "Usage: $0 [--health | --concurrent N [--seq] [--max-tokens N] [PROMPT]] [--ports P1,P2,...]" >&2
       exit 2 ;;
     *)
       # Bare arg: treat as prompt text (concurrent mode only).
@@ -85,25 +111,47 @@ fi
 #   "0.0.0.0:8010->8000/tcp"  → host port 8010
 # Uses portable grep -oE (works on mawk/gawk/busybox alike).
 entries=()
-while IFS='|' read -r cid name ports; do
-  [[ -z "$cid" ]] && continue
-  # Extract first :NNNN-> match and strip the punctuation around it
-  # tr -d ':>-' treats '-' as literal because it's the trailing char (avoids
-  # tr interpreting ':->' as a character range).
-  port=$(echo "$ports" | grep -oE ':[0-9]+->' | head -1 | tr -d ':>-')
-  [[ -n "$port" ]] && entries+=("${cid}|${name}|${port}")
-done < <(
-  docker ps --filter "name=^tt-inference-server-" \
-    --format '{{.ID}}|{{.Names}}|{{.Ports}}'
-)
+if [[ -n "$PORTS_CSV" ]]; then
+  # Explicit ports: skip docker discovery entirely (also works for non-container
+  # servers, e.g. a uvicorn wheel server). cid/name are synthesized; the model
+  # name on each port is discovered from /v1/models downstream.
+  IFS=',' read -ra _ports <<< "$PORTS_CSV"
+  for p in "${_ports[@]}"; do
+    entries+=("-|port-${p}|${p}")
+  done
+else
+  while IFS='|' read -r cid name ports; do
+    [[ -z "$cid" ]] && continue
+    # Extract first :NNNN-> match and strip the punctuation around it
+    # tr -d ':>-' treats '-' as literal because it's the trailing char (avoids
+    # tr interpreting ':->' as a character range).
+    port=$(echo "$ports" | grep -oE ':[0-9]+->' | head -1 | tr -d ':>-')
+    [[ -n "$port" ]] && entries+=("${cid}|${name}|${port}")
+  done < <(
+    docker ps --filter "name=^tt-inference-server-" \
+      --format '{{.ID}}|{{.Names}}|{{.Ports}}'
+  )
+fi
+
+# Sort entries by host port (numeric, field 3) so every section below —
+# the "Found" list, the per-server list, and the concurrent live/summary
+# lines — is ordered by port. (docker ps order is otherwise arbitrary.)
+if [[ ${#entries[@]} -gt 0 ]]; then
+  mapfile -t entries < <(printf '%s\n' "${entries[@]}" | sort -t'|' -k3,3n)
+fi
 
 if [[ ${#entries[@]} -eq 0 ]]; then
   echo "No running tt-inference-server-* containers found."
   exit 0
 fi
 
-echo "Found ${#entries[@]} tt-inference-server container(s):"
-printf '%s\n' "${entries[@]}" | awk -F'|' '{printf "  - %s (port %s) [%s]\n", $2, $3, $1}'
+if [[ -n "$PORTS_CSV" ]]; then
+  echo "Using ${#entries[@]} specified port(s):"
+else
+  echo "Found ${#entries[@]} tt-inference-server container(s):"
+fi
+# Container rows show name+port+id; --ports rows ("-|port-NNNN|NNNN") just show the port.
+printf '%s\n' "${entries[@]}" | awk -F'|' '{ if ($1=="-") printf "  - port %s (specified)\n", $3; else printf "  - %s (port %s) [%s]\n", $2, $3, $1 }'
 echo
 
 if [[ "$CONCURRENT_N" -gt 0 ]]; then
@@ -154,7 +202,7 @@ print(json.dumps(servers))"
   )"
 
   HOST="$HOST" API_KEY="${API_KEY:-your-secret-key}" \
-  CONCURRENT_N="$CONCURRENT_N" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" \
+  CONCURRENT_N="$CONCURRENT_N" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
   python3 -u <<'PYEOF'
 import json, os, sys, time, threading, shutil
 import requests
@@ -164,116 +212,130 @@ api_key = os.environ['API_KEY']
 n = int(os.environ['CONCURRENT_N'])
 max_tokens = int(os.environ['MAX_TOKENS'])
 prompt = os.environ['PROMPT_TEXT']
+seq = os.environ.get('SEQ', '0') == '1'
 servers = json.loads(os.environ['TT_SERVERS_JSON'])
 
 headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
 
-# Build per-stream descriptors: (server_short, server_full, port, idx_in_server)
-streams = []
-for srv in servers:
-    for i in range(n):
-        streams.append({
-            'short': srv['short'], 'full': srv['full'],
-            'port': srv['port'], 'idx': i + 1, 'of': n,
-        })
-total = len(streams)
+# Port-prefixed tag so identical model names on different ports are
+# distinguishable, e.g. "[8101] [Llama-3.2-3B-Instruct/1]".
+def tag_of(s):
+    return f"[{s['port']}] [{s['short']}/{s['idx']}]"
 
-# tag width for alignment, e.g. "[Falcon3-7B-Instruct/3]" -> 22 chars
-tag_width = max(len(f"[{s['short']}/{s['idx']}]") for s in streams)
+def make_streams(server_list):
+    out = []
+    for srv in server_list:
+        for i in range(n):
+            out.append({'short': srv['short'], 'full': srv['full'],
+                        'port': srv['port'], 'idx': i + 1, 'of': n})
+    return out
 
-lock = threading.Lock()
-buffers = [''] * total
-metrics = [None] * total
+# Compute tag width across ALL streams so alignment is stable across waves.
+tag_width = max(len(tag_of(s)) for s in make_streams(servers))
 
 def cols():
     return shutil.get_terminal_size((120, 24)).columns
 
-def redraw():
-    """Move cursor up `total` lines and redraw each stream's current line."""
-    sys.stdout.write(f'\033[{total}A')
-    width = cols()
-    for i, s in enumerate(streams):
-        tag = f"[{s['short']}/{s['idx']}]".ljust(tag_width)
-        max_text = width - tag_width - 1
-        text = buffers[i].replace('\n', ' ').replace('\r', ' ')
-        if max_text > 3 and len(text) > max_text:
-            text = text[:max_text - 3] + '...'
-        sys.stdout.write(f'\r\033[K{tag} {text}\n')
+def run_wave(streams):
+    """Run one wave of streams concurrently, redraw in place, print per-stream
+    summary. Returns the wave's wall time. Buffers/metrics are wave-local so
+    waves can run one after another (--seq)."""
+    total = len(streams)
+    buffers = [''] * total
+    metrics = [None] * total
+    lock = threading.Lock()
+
+    def redraw():
+        sys.stdout.write(f'\033[{total}A')
+        width = cols()
+        for i, s in enumerate(streams):
+            tag = tag_of(s).ljust(tag_width)
+            max_text = width - tag_width - 1
+            text = buffers[i].replace('\n', ' ').replace('\r', ' ')
+            if max_text > 3 and len(text) > max_text:
+                text = text[:max_text - 3] + '...'
+            sys.stdout.write(f'\r\033[K{tag} {text}\n')
+        sys.stdout.flush()
+
+    def run_stream(i, s):
+        start = time.perf_counter()
+        ttft = None
+        token_count = 0
+        try:
+            resp = requests.post(
+                f"http://{host}:{s['port']}/v1/chat/completions",
+                headers=headers,
+                json={'model': s['full'],
+                      'messages': [{'role': 'user', 'content': prompt}],
+                      'max_tokens': max_tokens, 'stream': True},
+                stream=True, timeout=300)
+            resp.raise_for_status()
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith('data: '):
+                    continue
+                data = line[len('data: '):]
+                if data.strip() == '[DONE]':
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choice = chunk['choices'][0]
+                text = choice.get('delta', {}).get('content', '')
+                finish = choice.get('finish_reason')
+                if text and ttft is None:
+                    ttft = time.perf_counter() - start
+                if text:
+                    token_count += 1
+                    with lock:
+                        buffers[i] += text
+                        redraw()
+                if finish:
+                    break
+        except Exception as e:
+            with lock:
+                buffers[i] += f' [ERROR: {type(e).__name__}: {e}]'
+                redraw()
+            return
+        elapsed = time.perf_counter() - start
+        if ttft and token_count > 1:
+            tps_str = f'{(token_count - 1) / (elapsed - ttft):.1f} tok/s'
+        else:
+            tps_str = 'n/a tok/s'
+        ttft_str = f'TTFT: {ttft*1000:.0f}ms' if ttft else 'TTFT: n/a'
+        metrics[i] = f'{token_count} tokens | {ttft_str} | {elapsed:.2f}s | {tps_str}'
+
+    # Reserve `total` blank lines for the redraw region.
+    for s in streams:
+        print(f"{tag_of(s).ljust(tag_width)} ")
     sys.stdout.flush()
 
-def run_stream(i, s):
-    start = time.perf_counter()
-    ttft = None
-    token_count = 0
-    try:
-        resp = requests.post(
-            f"http://{host}:{s['port']}/v1/chat/completions",
-            headers=headers,
-            json={
-                'model': s['full'],
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': max_tokens,
-                'stream': True,
-            },
-            stream=True,
-            timeout=300,
-        )
-        resp.raise_for_status()
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith('data: '):
-                continue
-            data = line[len('data: '):]
-            if data.strip() == '[DONE]':
-                break
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            choice = chunk['choices'][0]
-            text = choice.get('delta', {}).get('content', '')
-            finish = choice.get('finish_reason')
-            if text and ttft is None:
-                ttft = time.perf_counter() - start
-            if text:
-                token_count += 1
-                with lock:
-                    buffers[i] += text
-                    redraw()
-            if finish:
-                break
-    except Exception as e:
-        with lock:
-            buffers[i] += f' [ERROR: {type(e).__name__}: {e}]'
-            redraw()
-        return
-    elapsed = time.perf_counter() - start
-    if ttft and token_count > 1:
-        tps = (token_count - 1) / (elapsed - ttft)
-        tps_str = f'{tps:.1f} tok/s'
-    else:
-        tps_str = 'n/a tok/s'
-    ttft_str = f'TTFT: {ttft*1000:.0f}ms' if ttft else 'TTFT: n/a'
-    metrics[i] = f'{token_count} tokens | {ttft_str} | {elapsed:.2f}s | {tps_str}'
+    threads = [threading.Thread(target=run_stream, args=(i, s)) for i, s in enumerate(streams)]
+    ws = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    we = time.perf_counter() - ws
 
-# Reserve `total` blank lines for the redraw region.
-for s in streams:
-    tag = f"[{s['short']}/{s['idx']}]".ljust(tag_width)
-    print(f"{tag} ")
-sys.stdout.flush()
+    print()
+    for i, s in enumerate(streams):
+        print(f'{tag_of(s).ljust(tag_width)} {metrics[i] if metrics[i] else "no metrics (error?)"}')
+    return we
 
-threads = [threading.Thread(target=run_stream, args=(i, s)) for i, s in enumerate(streams)]
-wall_start = time.perf_counter()
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
-wall_elapsed = time.perf_counter() - wall_start
-
-print()
-for i, s in enumerate(streams):
-    tag = f"[{s['short']}/{s['idx']}]".ljust(tag_width)
-    print(f'{tag} {metrics[i] if metrics[i] else "no metrics (error?)"}')
-print(f'--- Wall time: {wall_elapsed:.2f}s ---')
+if seq:
+    # One server at a time (its N streams still run together) so cross-server
+    # host-CPU contention (cpu_sampling) doesn't depress each server's tok/s.
+    grand = 0.0
+    for srv in servers:
+        we = run_wave(make_streams([srv]))
+        grand += we
+        print(f'--- {srv["short"]} (port {srv["port"]}) wall: {we:.2f}s ---')
+        print()
+    print(f'=== sequential-across-servers total wall: {grand:.2f}s ===')
+else:
+    we = run_wave(make_streams(servers))
+    print(f'--- Wall time: {we:.2f}s ---')
 PYEOF
   exit $?
 fi
