@@ -370,6 +370,45 @@ $ ./decode_roofline.py 8
 
 ---
 
+### 📋 forge_models_table.py
+**Summarize the models-ci-config.json into a per-(model, engine) table**
+
+```bash
+./forge_models_table.py <models-ci-config.json>            # FORGE models (default)
+./forge_models_table.py <config> -e all                    # every engine
+./forge_models_table.py <config> -e vLLM -s release        # vLLM, release stage only
+./forge_models_table.py <config> -d N150                   # only configs that run on N150
+./forge_models_table.py <config> --sort num_devices        # sort by device count
+```
+
+**Output**: A table with one row per `(model, inference engine)` config — columns are model name, engine, CI stages (nightly/weekly/release), runner devices, and device count — followed by the total number of unique model configs and distinct model names matched.
+
+**Use when**: You want a quick view of which models in `tt-inference-server/.github/workflows/models-ci-config.json` run under a given engine (FORGE / vLLM / MEDIA), on which runners, and in which CI stages — e.g. confirming whether a given model is a Forge model or auditing release coverage.
+
+**Args**:
+- `config` (required, positional) — path to `models-ci-config.json`.
+- `-e/--engine` — filter by inference engine (default `FORGE`; use `all` to disable).
+- `-s/--stage` — filter by CI stage: `nightly`, `weekly`, or `release`.
+- `-d/--device` — filter by runner/device, e.g. `N150`, `T3K`, `GALAXY`.
+- `--sort {model,engine,num_devices}` — sort column (default `model`).
+
+**Note**: Handles both config shapes — models with a top-level `inference_engine`, and models with an `implementations` list (multiple engines per model name are flattened into one row each).
+
+**Example**:
+```bash
+$ ./forge_models_table.py ~/tt-inference-server/.github/workflows/models-ci-config.json
+MODEL                  ENGINE  CI STAGES  RUNNERS (DEVICES)  #RUN
+---------------------  ------  ---------  -----------------  ----
+Falcon3-7B-Instruct    FORGE   nightly    N150, N300         2
+Qwen3-4B               FORGE   nightly    N150               1
+resnet-50              FORGE   nightly    N150               1
+...
+Total unique model configs (FORGE): 13
+Distinct model names: 13
+```
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
