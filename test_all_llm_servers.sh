@@ -19,6 +19,13 @@
 #   ./test_all_llm_servers.sh --concurrent 1 --seq                  # one server at a
 #                                                                   # time (no cross-server
 #                                                                   # host-CPU contention)
+#   ./test_all_llm_servers.sh --concurrent 32 --isl 1024 --osl 128  # fixed input/output
+#                                                                   # lengths: synthetic
+#                                                                   # ~1024-token prompt
+#                                                                   # (calibrated via
+#                                                                   # /tokenize), exactly
+#                                                                   # 128 output tokens
+#                                                                   # (ignore_eos)
 #   ./test_all_llm_servers.sh --concurrent 1 --ports 8101,8102      # use explicit ports
 #                                                                   # instead of docker
 #                                                                   # discovery (models found
@@ -46,6 +53,14 @@
 #   mirrors client_demo_concurrent.sh — one streaming line per (server,stream)
 #   redrawn in-place, followed by TTFT / tok-per-sec per stream and total wall
 #   time. Prompt defaults to "Tell me a quick story".
+# - --isl N / --osl N (concurrent mode) set the input / output sequence lengths.
+#   --isl builds a synthetic but readable prompt calibrated to ~N input tokens
+#   via each server's /tokenize endpoint (per-model, since tokenizers differ).
+#   --osl sets max_tokens to N (an upper bound) and requests ignore_eos: on
+#   servers that honor it (e.g. stock vLLM) output is exactly N tokens; servers
+#   that ignore it (some TT vLLM builds) may stop earlier at the natural EOS.
+#   Either way the per-stream summary reports the ACTUAL ISL/OSL from the
+#   response's usage field (ground truth, incl. chat-template tokens).
 
 set -u
 
@@ -55,6 +70,8 @@ PROMPT_TEXT=""
 MAX_TOKENS=32
 SEQ=0
 PORTS_CSV=""
+ISL=0          # target input  seq length (tokens); 0 = use PROMPT_TEXT as-is
+OSL=0          # target output seq length (tokens); 0 = use MAX_TOKENS, EOS allowed
 
 # Parse args. Recognized flags: --health | --concurrent N | --max-tokens N.
 # A bare positional (no leading --) is taken as the prompt text and only makes
@@ -80,6 +97,28 @@ while [[ $# -gt 0 ]]; do
       fi
       MAX_TOKENS="$1"
       shift ;;
+    --isl)
+      # Concurrent mode only: build a synthetic prompt calibrated (via the
+      # server's /tokenize endpoint) to ~N input tokens, so you can sweep
+      # input lengths (1024, 2048, ...). Overrides any positional PROMPT.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --isl requires a positive integer (e.g. --isl 1024)" >&2
+        exit 2
+      fi
+      ISL="$1"
+      shift ;;
+    --osl)
+      # Concurrent mode only: output sequence length. Sets max_tokens to N AND
+      # forces ignore_eos so the model generates EXACTLY N tokens (clean tok/s
+      # at a fixed length). Takes precedence over --max-tokens.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --osl requires a positive integer (e.g. --osl 128)" >&2
+        exit 2
+      fi
+      OSL="$1"
+      shift ;;
     --seq)
       # Concurrent mode only: run servers ONE AT A TIME (each server's N
       # streams still run together), so cross-server host-CPU contention
@@ -99,7 +138,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --*)
       echo "ERROR: unknown flag: $1" >&2
-      echo "Usage: $0 [--health | --concurrent N [--seq] [--max-tokens N] [PROMPT]] [--ports P1,P2,...]" >&2
+      echo "Usage: $0 [--health | --concurrent N [--seq] [--max-tokens N] [--isl N] [--osl N] [PROMPT]] [--ports P1,P2,...]" >&2
       exit 2 ;;
     *)
       # Bare arg: treat as prompt text (concurrent mode only).
@@ -107,6 +146,11 @@ while [[ $# -gt 0 ]]; do
       shift ;;
   esac
 done
+
+# --osl is the output sequence length: it sets max_tokens and (in the Python
+# block) forces ignore_eos so generation runs to exactly OSL tokens. Wins over
+# --max-tokens.
+[[ "$OSL" -gt 0 ]] && MAX_TOKENS="$OSL"
 
 HOST="${HOST:-localhost}"
 TEST_SCRIPT="$(dirname "$0")/test_llm_server.sh"
@@ -214,7 +258,11 @@ if [[ "$CONCURRENT_N" -gt 0 ]]; then
   : "${PROMPT_TEXT:=Tell me a quick story}"
 
   echo "Concurrent mode: $CONCURRENT_N streams per server × ${#servers[@]} server(s)"
-  echo "Prompt: \"$PROMPT_TEXT\"  |  Max tokens: $MAX_TOKENS"
+  if [[ "$ISL" -gt 0 ]]; then
+    echo "ISL: ~$ISL input tokens (synthetic, calibrated via /tokenize)  |  OSL: $MAX_TOKENS output-token cap (ignore_eos requested)"
+  else
+    echo "Prompt: \"$PROMPT_TEXT\"  |  Max tokens: $MAX_TOKENS$([[ "$OSL" -gt 0 ]] && echo ' (ignore_eos requested)')"
+  fi
   for s in "${servers[@]}"; do
     IFS='|' read -r port full short <<< "$s"
     echo "  - $short (port $port)"
@@ -236,6 +284,7 @@ print(json.dumps(servers))"
 
   HOST="$HOST" API_KEY="${API_KEY:-your-secret-key}" \
   CONCURRENT_N="$CONCURRENT_N" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
+  ISL="$ISL" OSL="$OSL" \
   python3 -u <<'PYEOF'
 import json, os, sys, time, threading, shutil
 import requests
@@ -246,9 +295,71 @@ n = int(os.environ['CONCURRENT_N'])
 max_tokens = int(os.environ['MAX_TOKENS'])
 prompt = os.environ['PROMPT_TEXT']
 seq = os.environ.get('SEQ', '0') == '1'
+isl = int(os.environ.get('ISL', '0'))
+osl = int(os.environ.get('OSL', '0'))
 servers = json.loads(os.environ['TT_SERVERS_JSON'])
 
 headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+
+# When --osl is given we force the model to emit exactly OSL tokens (ignore the
+# EOS token), so tok/s is measured over a fixed output length.
+force_len = osl > 0
+
+# A coherent base passage; we grow/trim it (at word granularity) to hit the
+# target input-token count. Repetitive but readable English, so the prompt
+# "makes sense" rather than being random noise.
+_BASE = (
+    "The history of computing is a long story of people trying to do more with "
+    "less effort. Early machines filled entire rooms and could only add numbers, "
+    "yet each generation grew smaller, faster, and far more capable than the one "
+    "before it. Engineers learned to pack more transistors onto a single chip, "
+    "and software grew to take advantage of every gain in raw speed. Today a "
+    "phone in a pocket outpaces the supercomputers of a few decades ago. "
+).split()
+
+def _tokenize_count(port, model, text):
+    """Exact token count for `text` from the server's /tokenize endpoint."""
+    r = requests.post(f"http://{host}:{port}/tokenize", headers=headers,
+                      json={'model': model, 'prompt': text}, timeout=30)
+    r.raise_for_status()
+    return int(r.json()['count'])
+
+def build_isl_prompt(port, model, target):
+    """Build a sensible prompt whose token count is ~`target`, calibrated per
+    server via /tokenize (tokenizers differ between models). Returns (text,
+    measured_content_tokens). The chat template adds a small fixed overhead
+    (~10-15 tokens) on top of this; the real prompt_tokens is reported back in
+    the per-stream summary."""
+    # Ask for a long, detailed answer so output approaches the OSL cap even on
+    # servers that don't honor ignore_eos (they stop at the natural EOS).
+    instruction = ("Write a long, detailed, multi-paragraph summary and analysis "
+                   "of the following passage. Be thorough and elaborate:\n\n")
+    # Proportional search on word count; converges in a few rounds.
+    words = max(1, int(target * 0.75))
+    text = instruction + ' '.join(_BASE[i % len(_BASE)] for i in range(words))
+    cnt = _tokenize_count(port, model, text)
+    for _ in range(6):
+        if cnt == 0 or abs(cnt - target) <= max(2, int(target * 0.01)):
+            break
+        words = max(1, int(words * target / cnt))
+        text = instruction + ' '.join(_BASE[i % len(_BASE)] for i in range(words))
+        cnt = _tokenize_count(port, model, text)
+    return text, cnt
+
+# Precompute the per-server prompt once (calibration is server-specific).
+prompts = {}
+if isl > 0:
+    for srv in servers:
+        try:
+            text, cnt = build_isl_prompt(srv['port'], srv['full'], isl)
+            prompts[srv['port']] = text
+            print(f"[{srv['port']}] calibrated prompt: ~{cnt} content tokens "
+                  f"(target ISL {isl}; +chat-template overhead)")
+        except Exception as e:
+            print(f"[{srv['port']}] ISL calibration failed ({type(e).__name__}: {e}); "
+                  f"falling back to default prompt")
+            prompts[srv['port']] = prompt
+    print()
 
 # Port-prefixed tag so identical model names on different ports are
 # distinguishable, e.g. "[8101] [Llama-3.2-3B-Instruct/1]".
@@ -294,14 +405,18 @@ def run_wave(streams):
         start = time.perf_counter()
         ttft = None
         token_count = 0
+        prompt_toks = None       # actual ISL, from response usage
+        completion_toks = None   # actual OSL, from response usage
+        body = {'model': s['full'],
+                'messages': [{'role': 'user', 'content': prompts.get(s['port'], prompt)}],
+                'max_tokens': max_tokens, 'stream': True,
+                'stream_options': {'include_usage': True}}
+        if force_len:
+            body['ignore_eos'] = True
         try:
             resp = requests.post(
                 f"http://{host}:{s['port']}/v1/chat/completions",
-                headers=headers,
-                json={'model': s['full'],
-                      'messages': [{'role': 'user', 'content': prompt}],
-                      'max_tokens': max_tokens, 'stream': True},
-                stream=True, timeout=300)
+                headers=headers, json=body, stream=True, timeout=300)
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith('data: '):
@@ -313,7 +428,15 @@ def run_wave(streams):
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                choice = chunk['choices'][0]
+                # Final usage chunk (include_usage) carries empty choices.
+                usage = chunk.get('usage')
+                if usage:
+                    prompt_toks = usage.get('prompt_tokens', prompt_toks)
+                    completion_toks = usage.get('completion_tokens', completion_toks)
+                choices = chunk.get('choices') or []
+                if not choices:
+                    continue
+                choice = choices[0]
                 text = choice.get('delta', {}).get('content', '')
                 finish = choice.get('finish_reason')
                 if text and ttft is None:
@@ -331,12 +454,17 @@ def run_wave(streams):
                 redraw()
             return
         elapsed = time.perf_counter() - start
-        if ttft and token_count > 1:
-            tps_str = f'{(token_count - 1) / (elapsed - ttft):.1f} tok/s'
+        out_toks = completion_toks if completion_toks is not None else token_count
+        if ttft and out_toks > 1:
+            tps_str = f'{(out_toks - 1) / (elapsed - ttft):.1f} tok/s'
         else:
             tps_str = 'n/a tok/s'
         ttft_str = f'TTFT: {ttft*1000:.0f}ms' if ttft else 'TTFT: n/a'
-        metrics[i] = f'{token_count} tokens | {ttft_str} | {elapsed:.2f}s | {tps_str}'
+        # Show actual ISL/OSL from usage when available.
+        io_str = ''
+        if prompt_toks is not None:
+            io_str = f'ISL {prompt_toks} | OSL {out_toks} | '
+        metrics[i] = f'{io_str}{ttft_str} | {elapsed:.2f}s | {tps_str}'
 
     # Reserve `total` blank lines for the redraw region.
     for s in streams:
