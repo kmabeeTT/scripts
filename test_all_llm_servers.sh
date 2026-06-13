@@ -1,6 +1,11 @@
 #!/bin/bash
-# Find all running tt-inference-server-* containers, extract each one's
-# published host port, and run test_llm_server.sh against it.
+# Discover running LLM servers and run test_llm_server.sh against each. Two
+# discovery sources are combined (deduped by host port):
+#   1. Docker: running tt-inference-server-* containers + published host ports
+#      (parsed from `docker ps`). Skipped silently if docker isn't installed.
+#   2. Local processes: manually spun-up uvicorn/vllm servers (e.g. a wheel
+#      server launched by launch_*.sh) — the bound port is read straight from
+#      the process command line, so containerless servers are found too.
 #
 # Usage:
 #   ./test_all_llm_servers.sh                                       # default mode
@@ -23,8 +28,13 @@
 #   API_KEY=xxx ./test_all_llm_servers.sh
 #
 # Notes:
-# - Only containers named with the prefix "tt-inference-server-" are considered
-#   (matches what run.py auto-generates: tt-inference-server-<short-uuid>).
+# - Docker discovery only considers containers named with the prefix
+#   "tt-inference-server-" (matches what run.py auto-generates:
+#   tt-inference-server-<short-uuid>). If docker isn't on PATH (e.g. running
+#   inside a container), this source is skipped silently.
+# - Local-process discovery scans for uvicorn/vllm processes and reads their
+#   --port from the command line. Non-LLM ports are harmless: the /health +
+#   /v1/models gate skips anything that isn't an OpenAI-compatible LLM.
 # - Skips containers that don't respond healthy on /health (still warming up
 #   or already crashed).
 # - Skips containers whose /v1/models returns no entries (e.g. CNN servers).
@@ -106,13 +116,11 @@ if [[ "$HEALTH_ONLY" -eq 0 && "$CONCURRENT_N" -eq 0 && ! -x "$TEST_SCRIPT" ]]; t
   exit 1
 fi
 
-# List running tt-inference-server-* containers + their host ports.
-# `docker ps --format` gives us "ID|NAME|PORTS" lines; we parse PORTS like:
-#   "0.0.0.0:8010->8000/tcp"  → host port 8010
-# Uses portable grep -oE (works on mawk/gawk/busybox alike).
+# Build the list of (cid|name|port) entries to test from the two discovery
+# sources below. `--ports` overrides both and uses the given ports verbatim.
 entries=()
 if [[ -n "$PORTS_CSV" ]]; then
-  # Explicit ports: skip docker discovery entirely (also works for non-container
+  # Explicit ports: skip discovery entirely (also works for non-container
   # servers, e.g. a uvicorn wheel server). cid/name are synthesized; the model
   # name on each port is discovered from /v1/models downstream.
   IFS=',' read -ra _ports <<< "$PORTS_CSV"
@@ -120,38 +128,63 @@ if [[ -n "$PORTS_CSV" ]]; then
     entries+=("-|port-${p}|${p}")
   done
 else
-  while IFS='|' read -r cid name ports; do
-    [[ -z "$cid" ]] && continue
-    # Extract first :NNNN-> match and strip the punctuation around it
-    # tr -d ':>-' treats '-' as literal because it's the trailing char (avoids
-    # tr interpreting ':->' as a character range).
-    port=$(echo "$ports" | grep -oE ':[0-9]+->' | head -1 | tr -d ':>-')
-    [[ -n "$port" ]] && entries+=("${cid}|${name}|${port}")
-  done < <(
-    docker ps --filter "name=^tt-inference-server-" \
-      --format '{{.ID}}|{{.Names}}|{{.Ports}}'
-  )
+  # 1. Docker containers (only if docker is installed). `docker ps --format`
+  #    gives "ID|NAME|PORTS" lines; we parse PORTS like:
+  #      "0.0.0.0:8010->8000/tcp"  → host port 8010
+  #    Uses portable grep -oE (works on mawk/gawk/busybox alike).
+  if command -v docker >/dev/null 2>&1; then
+    while IFS='|' read -r cid name ports; do
+      [[ -z "$cid" ]] && continue
+      # Extract first :NNNN-> match and strip the punctuation around it
+      # tr -d ':>-' treats '-' as literal because it's the trailing char (avoids
+      # tr interpreting ':->' as a character range).
+      port=$(echo "$ports" | grep -oE ':[0-9]+->' | head -1 | tr -d ':>-')
+      [[ -n "$port" ]] && entries+=("${cid}|${name}|${port}")
+    done < <(
+      docker ps --filter "name=^tt-inference-server-" \
+        --format '{{.ID}}|{{.Names}}|{{.Ports}}' 2>/dev/null
+    )
+  fi
+
+  # 2. Local uvicorn/vllm processes (manually spun-up, non-container servers).
+  #    Read the bound port straight from each matching process command line
+  #    (handles both "--port 8004" and "--port=8004"). cid is "-"; the label
+  #    is just the server kind + port. Anything that isn't actually an LLM is
+  #    filtered out later by the /health + /v1/models probe.
+  while IFS= read -r cmd; do
+    case "$cmd" in
+      *uvicorn*|*vllm*|*main:app*|*openai.api_server*) ;;
+      *) continue ;;
+    esac
+    lport=$(printf '%s\n' "$cmd" | grep -oE -- '--port[= ]+[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    [[ -z "$lport" ]] && continue
+    if   [[ "$cmd" == *uvicorn* ]]; then lbl=uvicorn
+    elif [[ "$cmd" == *vllm*    ]]; then lbl=vllm
+    else                                 lbl=server; fi
+    entries+=("-|${lbl}-${lport}|${lport}")
+  done < <(ps -eo args= 2>/dev/null)
 fi
 
-# Sort entries by host port (numeric, field 3) so every section below —
-# the "Found" list, the per-server list, and the concurrent live/summary
-# lines — is ordered by port. (docker ps order is otherwise arbitrary.)
+# Sort entries by host port (numeric, field 3) so every section below — the
+# "Found" list, the per-server list, and the concurrent live/summary lines —
+# is ordered by port, and dedupe by port (a server seen by both docker and the
+# process scan should appear once; first wins, so the docker row is kept).
 if [[ ${#entries[@]} -gt 0 ]]; then
-  mapfile -t entries < <(printf '%s\n' "${entries[@]}" | sort -t'|' -k3,3n)
+  mapfile -t entries < <(printf '%s\n' "${entries[@]}" | sort -t'|' -k3,3n | awk -F'|' '!seen[$3]++')
 fi
 
 if [[ ${#entries[@]} -eq 0 ]]; then
-  echo "No running tt-inference-server-* containers found."
+  echo "No servers found (no tt-inference-server-* containers, no local uvicorn/vllm LLM processes)."
   exit 0
 fi
 
 if [[ -n "$PORTS_CSV" ]]; then
   echo "Using ${#entries[@]} specified port(s):"
 else
-  echo "Found ${#entries[@]} tt-inference-server container(s):"
+  echo "Found ${#entries[@]} server(s) (docker containers + local uvicorn/vllm):"
 fi
-# Container rows show name+port+id; --ports rows ("-|port-NNNN|NNNN") just show the port.
-printf '%s\n' "${entries[@]}" | awk -F'|' '{ if ($1=="-") printf "  - port %s (specified)\n", $3; else printf "  - %s (port %s) [%s]\n", $2, $3, $1 }'
+# Container rows show name+port+id; local/specified rows ("-|...") show name+port.
+printf '%s\n' "${entries[@]}" | awk -F'|' '{ if ($1=="-") printf "  - %s (port %s)\n", $2, $3; else printf "  - %s (port %s) [%s]\n", $2, $3, $1 }'
 echo
 
 if [[ "$CONCURRENT_N" -gt 0 ]]; then
