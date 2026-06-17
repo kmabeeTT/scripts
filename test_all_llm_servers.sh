@@ -259,7 +259,7 @@ if [[ "$CONCURRENT_N" -gt 0 ]]; then
 
   echo "Concurrent mode: $CONCURRENT_N streams per server × ${#servers[@]} server(s)"
   if [[ "$ISL" -gt 0 ]]; then
-    echo "ISL: ~$ISL input tokens (synthetic, calibrated via /tokenize)  |  OSL: $MAX_TOKENS output-token cap (ignore_eos requested)"
+    echo "ISL: exactly $ISL input tokens (raw token IDs via /v1/completions; non-English, no calibration)  |  OSL: $MAX_TOKENS output-token cap (ignore_eos requested)"
   else
     echo "Prompt: \"$PROMPT_TEXT\"  |  Max tokens: $MAX_TOKENS$([[ "$OSL" -gt 0 ]] && echo ' (ignore_eos requested)')"
   fi
@@ -305,60 +305,21 @@ headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/js
 # EOS token), so tok/s is measured over a fixed output length.
 force_len = osl > 0
 
-# A coherent base passage; we grow/trim it (at word granularity) to hit the
-# target input-token count. Repetitive but readable English, so the prompt
-# "makes sense" rather than being random noise.
-_BASE = (
-    "The history of computing is a long story of people trying to do more with "
-    "less effort. Early machines filled entire rooms and could only add numbers, "
-    "yet each generation grew smaller, faster, and far more capable than the one "
-    "before it. Engineers learned to pack more transistors onto a single chip, "
-    "and software grew to take advantage of every gain in raw speed. Today a "
-    "phone in a pocket outpaces the supercomputers of a few decades ago. "
-).split()
+# Token mode (--isl): instead of generating English text and round-tripping the
+# slow /tokenize endpoint to calibrate its length, we send a raw list of token
+# IDs straight to /v1/completions. The input length is then EXACTLY `isl`
+# tokens with zero server calls and no chat-template overhead. Output is
+# non-English gibberish (we don't care — this path is for throughput numbers).
+token_mode = isl > 0
+# An ordinary mid-vocab content token id, valid in every real model's vocab
+# (vocabs are 32k-150k+); used only as raw /v1/completions *input*, so it never
+# affects generation (output stops on max_tokens / EOS, not on input content).
+SAFE_TOKEN_ID = 1000
+token_prompt = [SAFE_TOKEN_ID] * isl if token_mode else None
 
-def _tokenize_count(port, model, text):
-    """Exact token count for `text` from the server's /tokenize endpoint."""
-    r = requests.post(f"http://{host}:{port}/tokenize", headers=headers,
-                      json={'model': model, 'prompt': text}, timeout=30)
-    r.raise_for_status()
-    return int(r.json()['count'])
-
-def build_isl_prompt(port, model, target):
-    """Build a sensible prompt whose token count is ~`target`, calibrated per
-    server via /tokenize (tokenizers differ between models). Returns (text,
-    measured_content_tokens). The chat template adds a small fixed overhead
-    (~10-15 tokens) on top of this; the real prompt_tokens is reported back in
-    the per-stream summary."""
-    # Ask for a long, detailed answer so output approaches the OSL cap even on
-    # servers that don't honor ignore_eos (they stop at the natural EOS).
-    instruction = ("Write a long, detailed, multi-paragraph summary and analysis "
-                   "of the following passage. Be thorough and elaborate:\n\n")
-    # Proportional search on word count; converges in a few rounds.
-    words = max(1, int(target * 0.75))
-    text = instruction + ' '.join(_BASE[i % len(_BASE)] for i in range(words))
-    cnt = _tokenize_count(port, model, text)
-    for _ in range(6):
-        if cnt == 0 or abs(cnt - target) <= max(2, int(target * 0.01)):
-            break
-        words = max(1, int(words * target / cnt))
-        text = instruction + ' '.join(_BASE[i % len(_BASE)] for i in range(words))
-        cnt = _tokenize_count(port, model, text)
-    return text, cnt
-
-# Precompute the per-server prompt once (calibration is server-specific).
-prompts = {}
-if isl > 0:
-    for srv in servers:
-        try:
-            text, cnt = build_isl_prompt(srv['port'], srv['full'], isl)
-            prompts[srv['port']] = text
-            print(f"[{srv['port']}] calibrated prompt: ~{cnt} content tokens "
-                  f"(target ISL {isl}; +chat-template overhead)")
-        except Exception as e:
-            print(f"[{srv['port']}] ISL calibration failed ({type(e).__name__}: {e}); "
-                  f"falling back to default prompt")
-            prompts[srv['port']] = prompt
+if token_mode:
+    print(f"Token mode: sending exactly {isl} input token(s) per stream as raw token IDs "
+          f"via /v1/completions (no /tokenize calibration; output is non-English).")
     print()
 
 # Port-prefixed tag so identical model names on different ports are
@@ -378,7 +339,50 @@ def make_streams(server_list):
 tag_width = max(len(tag_of(s)) for s in make_streams(servers))
 
 def cols():
-    return shutil.get_terminal_size((120, 24)).columns
+    # Detect the REAL terminal/pane width via the tty ioctl. Deliberately does
+    # NOT use shutil.get_terminal_size, which consults $COLUMNS first — that var
+    # is frequently stale in tmux (it keeps the pre-split width), which makes us
+    # draw wider than the pane and flood it with soft-wraps. Try each std fd and
+    # then /dev/tty; fall back to a SAFE narrow 80 (under-fill, never overflow).
+    for fd in (1, 2, 0):
+        try:
+            return os.get_terminal_size(fd).columns
+        except OSError:
+            pass
+    try:
+        with open('/dev/tty') as _tty:
+            return os.get_terminal_size(_tty.fileno()).columns
+    except OSError:
+        return 80
+
+def _char_cells(ch):
+    """Display width of a single char: 2 for CJK/fullwidth/emoji (which render
+    double-wide but count as one Python char), else 1."""
+    o = ord(ch)
+    if (0x1100 <= o <= 0x115F or 0x2329 <= o <= 0x232A or
+            0x2E80 <= o <= 0xA4CF or 0xAC00 <= o <= 0xD7A3 or
+            0xF900 <= o <= 0xFAFF or 0xFE10 <= o <= 0xFE19 or
+            0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60 or
+            0xFFE0 <= o <= 0xFFE6 or 0x1F300 <= o <= 0x1FAFF or
+            0x20000 <= o <= 0x3FFFD):
+        return 2
+    return 1
+
+def fit_cells_tail(s, max_cells):
+    """Keep the TAIL of `s` whose on-screen width is <= max_cells (counting
+    wide glyphs as 2), so the newest tokens stay visible and older text scrolls
+    off the left. Returns (text, used_cells, truncated)."""
+    if max_cells <= 0:
+        return '', 0, len(s) > 0
+    out, used = [], 0
+    # Walk from the end, prepending until we'd exceed the budget.
+    for ch in reversed(s):
+        cw = _char_cells(ch)
+        if used + cw > max_cells:
+            return ''.join(reversed(out)), used, True
+        out.append(ch)
+        used += cw
+    return ''.join(reversed(out)), used, False
 
 def run_wave(streams):
     """Run one wave of streams concurrently, redraw in place, print per-stream
@@ -394,10 +398,20 @@ def run_wave(streams):
         width = cols()
         for i, s in enumerate(streams):
             tag = tag_of(s).ljust(tag_width)
-            max_text = width - tag_width - 1
+            # Budget cells for the text: pane width minus the tag, the space
+            # after it, and a 1-cell right margin so we never touch the edge.
+            # Show the TAIL (newest tokens) so the line scrolls left and stays
+            # visibly alive; older text slides off behind a leading ellipsis.
+            # Sized by DISPLAY width (CJK glyphs are 2 cells) so the line can
+            # never wrap — wrapping would break the \033[A cursor-up redraw.
+            max_cells = width - tag_width - 2
             text = buffers[i].replace('\n', ' ').replace('\r', ' ')
-            if max_text > 3 and len(text) > max_text:
-                text = text[:max_text - 3] + '...'
+            if max_cells > 1:
+                # Reserve 1 cell for the leading '…' when we've truncated.
+                fitted, _, trunc = fit_cells_tail(text, max_cells - 1)
+                text = ('…' + fitted) if trunc else fitted
+            else:
+                text = ''
             sys.stdout.write(f'\r\033[K{tag} {text}\n')
         sys.stdout.flush()
 
@@ -405,17 +419,29 @@ def run_wave(streams):
         start = time.perf_counter()
         ttft = None
         token_count = 0
-        prompt_toks = None       # actual ISL, from response usage
+        # Token mode sends exactly `isl` token IDs, so ISL is known a priori
+        # (this build's /v1/completions stream omits the usage chunk). Chat mode
+        # fills both in from the final usage chunk.
+        prompt_toks = isl if token_mode else None   # actual ISL
         completion_toks = None   # actual OSL, from response usage
-        body = {'model': s['full'],
-                'messages': [{'role': 'user', 'content': prompts.get(s['port'], prompt)}],
-                'max_tokens': max_tokens, 'stream': True,
-                'stream_options': {'include_usage': True}}
+        # Token mode (--isl): raw token-ID prompt to /v1/completions (exact ISL,
+        # no chat template). Otherwise: English text to /v1/chat/completions.
+        if token_mode:
+            endpoint = 'completions'
+            body = {'model': s['full'], 'prompt': token_prompt,
+                    'max_tokens': max_tokens, 'stream': True,
+                    'stream_options': {'include_usage': True}}
+        else:
+            endpoint = 'chat/completions'
+            body = {'model': s['full'],
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': max_tokens, 'stream': True,
+                    'stream_options': {'include_usage': True}}
         if force_len:
             body['ignore_eos'] = True
         try:
             resp = requests.post(
-                f"http://{host}:{s['port']}/v1/chat/completions",
+                f"http://{host}:{s['port']}/v1/{endpoint}",
                 headers=headers, json=body, stream=True, timeout=300)
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=True):
@@ -437,7 +463,9 @@ def run_wave(streams):
                 if not choices:
                     continue
                 choice = choices[0]
-                text = choice.get('delta', {}).get('content', '')
+                # /v1/completions streams 'text'; chat streams 'delta.content'.
+                text = (choice.get('text', '') if token_mode
+                        else choice.get('delta', {}).get('content', ''))
                 finish = choice.get('finish_reason')
                 if text and ttft is None:
                     ttft = time.perf_counter() - start
