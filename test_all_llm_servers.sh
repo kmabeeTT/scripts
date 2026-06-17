@@ -20,12 +20,17 @@
 #                                                                   # time (no cross-server
 #                                                                   # host-CPU contention)
 #   ./test_all_llm_servers.sh --concurrent 32 --isl 1024 --osl 128  # fixed input/output
-#                                                                   # lengths: synthetic
-#                                                                   # ~1024-token prompt
-#                                                                   # (calibrated via
-#                                                                   # /tokenize), exactly
-#                                                                   # 128 output tokens
-#                                                                   # (ignore_eos)
+#                                                                   # lengths: exact
+#                                                                   # 1024-token raw
+#                                                                   # token-ID prompt,
+#                                                                   # exactly 128 output
+#                                                                   # tokens (ignore_eos)
+#   ./test_all_llm_servers.sh --concurrent 1,4 --isl 128 \
+#       --osl 128,256,512,1024                                      # SWEEP: cross product
+#                                                                   # of concurrency × ISL
+#                                                                   # × OSL (here 8 points);
+#                                                                   # prints a comparison
+#                                                                   # table at the end
 #   ./test_all_llm_servers.sh --concurrent 1 --ports 8101,8102      # use explicit ports
 #                                                                   # instead of docker
 #                                                                   # discovery (models found
@@ -65,13 +70,13 @@
 set -u
 
 HEALTH_ONLY=0
-CONCURRENT_N=0
+CONCURRENT_CSV=""   # comma list of concurrency levels, e.g. "1,4"; empty = not concurrent mode
 PROMPT_TEXT=""
 MAX_TOKENS=32
 SEQ=0
 PORTS_CSV=""
-ISL=0          # target input  seq length (tokens); 0 = use PROMPT_TEXT as-is
-OSL=0          # target output seq length (tokens); 0 = use MAX_TOKENS, EOS allowed
+ISL_CSV="0"        # comma list of input  seq lengths (tokens); 0 = use PROMPT_TEXT as-is
+OSL_CSV="0"        # comma list of output seq lengths (tokens); 0 = use MAX_TOKENS, EOS allowed
 
 # Parse args. Recognized flags: --health | --concurrent N | --max-tokens N.
 # A bare positional (no leading --) is taken as the prompt text and only makes
@@ -82,12 +87,15 @@ while [[ $# -gt 0 ]]; do
       HEALTH_ONLY=1
       shift ;;
     --concurrent)
+      # One or more concurrency levels, comma-separated (e.g. 4 or 1,4,8). With
+      # multiple values (and/or multiple --isl/--osl) the script sweeps the
+      # cross product and prints a comparison table at the end.
       shift
-      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: --concurrent requires a positive integer (e.g. --concurrent 4)" >&2
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "ERROR: --concurrent requires positive integer(s), comma-separated (e.g. --concurrent 4 or 1,4,8)" >&2
         exit 2
       fi
-      CONCURRENT_N="$1"
+      CONCURRENT_CSV="$1"
       shift ;;
     --max-tokens|-n)
       shift
@@ -98,26 +106,28 @@ while [[ $# -gt 0 ]]; do
       MAX_TOKENS="$1"
       shift ;;
     --isl)
-      # Concurrent mode only: build a synthetic prompt calibrated (via the
-      # server's /tokenize endpoint) to ~N input tokens, so you can sweep
-      # input lengths (1024, 2048, ...). Overrides any positional PROMPT.
+      # Concurrent mode only: input sequence length(s), comma-separated to sweep
+      # (e.g. 128 or 128,512,1024). Each value sends a raw token-ID prompt of
+      # EXACTLY that many tokens via /v1/completions (no calibration). Overrides
+      # any positional PROMPT.
       shift
-      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: --isl requires a positive integer (e.g. --isl 1024)" >&2
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "ERROR: --isl requires positive integer(s), comma-separated (e.g. --isl 1024 or 128,512,1024)" >&2
         exit 2
       fi
-      ISL="$1"
+      ISL_CSV="$1"
       shift ;;
     --osl)
-      # Concurrent mode only: output sequence length. Sets max_tokens to N AND
-      # forces ignore_eos so the model generates EXACTLY N tokens (clean tok/s
+      # Concurrent mode only: output sequence length(s), comma-separated to
+      # sweep (e.g. 128 or 128,256,512). Each value sets max_tokens AND forces
+      # ignore_eos so the model generates EXACTLY that many tokens (clean tok/s
       # at a fixed length). Takes precedence over --max-tokens.
       shift
-      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: --osl requires a positive integer (e.g. --osl 128)" >&2
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "ERROR: --osl requires positive integer(s), comma-separated (e.g. --osl 128 or 128,256,512)" >&2
         exit 2
       fi
-      OSL="$1"
+      OSL_CSV="$1"
       shift ;;
     --seq)
       # Concurrent mode only: run servers ONE AT A TIME (each server's N
@@ -138,7 +148,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --*)
       echo "ERROR: unknown flag: $1" >&2
-      echo "Usage: $0 [--health | --concurrent N [--seq] [--max-tokens N] [--isl N] [--osl N] [PROMPT]] [--ports P1,P2,...]" >&2
+      echo "Usage: $0 [--health | --concurrent N[,N...] [--seq] [--max-tokens N] [--isl N[,N...]] [--osl N[,N...]] [PROMPT]] [--ports P1,P2,...]" >&2
       exit 2 ;;
     *)
       # Bare arg: treat as prompt text (concurrent mode only).
@@ -147,15 +157,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --osl is the output sequence length: it sets max_tokens and (in the Python
-# block) forces ignore_eos so generation runs to exactly OSL tokens. Wins over
-# --max-tokens.
-[[ "$OSL" -gt 0 ]] && MAX_TOKENS="$OSL"
+# --osl (output sequence length) sets max_tokens per value and forces ignore_eos
+# in the Python block; the per-OSL value wins over --max-tokens. The mapping is
+# done per combo inside Python now that OSL can be a list.
 
 HOST="${HOST:-localhost}"
 TEST_SCRIPT="$(dirname "$0")/test_llm_server.sh"
 
-if [[ "$HEALTH_ONLY" -eq 0 && "$CONCURRENT_N" -eq 0 && ! -x "$TEST_SCRIPT" ]]; then
+if [[ "$HEALTH_ONLY" -eq 0 && -z "$CONCURRENT_CSV" && ! -x "$TEST_SCRIPT" ]]; then
   echo "ERROR: $TEST_SCRIPT not found or not executable" >&2
   exit 1
 fi
@@ -231,7 +240,7 @@ fi
 printf '%s\n' "${entries[@]}" | awk -F'|' '{ if ($1=="-") printf "  - %s (port %s)\n", $2, $3; else printf "  - %s (port %s) [%s]\n", $2, $3, $1 }'
 echo
 
-if [[ "$CONCURRENT_N" -gt 0 ]]; then
+if [[ -n "$CONCURRENT_CSV" ]]; then
   # Build "port|model_short_name" list for ready LLM servers only.
   servers=()
   for entry in "${entries[@]}"; do
@@ -257,11 +266,17 @@ if [[ "$CONCURRENT_N" -gt 0 ]]; then
 
   : "${PROMPT_TEXT:=Tell me a quick story}"
 
-  echo "Concurrent mode: $CONCURRENT_N streams per server × ${#servers[@]} server(s)"
-  if [[ "$ISL" -gt 0 ]]; then
-    echo "ISL: exactly $ISL input tokens (raw token IDs via /v1/completions; non-English, no calibration)  |  OSL: $MAX_TOKENS output-token cap (ignore_eos requested)"
+  # Count datapoints in the cross product for the banner (concurrency × ISL × OSL).
+  _n_conc=$(awk -F, '{print NF}' <<< "$CONCURRENT_CSV")
+  _n_isl=$(awk -F, '{print NF}' <<< "$ISL_CSV")
+  _n_osl=$(awk -F, '{print NF}' <<< "$OSL_CSV")
+  _n_pts=$(( _n_conc * _n_isl * _n_osl ))
+  if [[ "$_n_pts" -gt 1 ]]; then
+    echo "Concurrent sweep: concurrency=[$CONCURRENT_CSV] × ISL=[$ISL_CSV] × OSL=[$OSL_CSV] = ${_n_pts} datapoints/server"
   else
-    echo "Prompt: \"$PROMPT_TEXT\"  |  Max tokens: $MAX_TOKENS$([[ "$OSL" -gt 0 ]] && echo ' (ignore_eos requested)')"
+    _isl_desc=$([[ "$ISL_CSV" == "0" ]] && echo "prompt=\"$PROMPT_TEXT\"" || echo "ISL $ISL_CSV (token IDs)")
+    _osl_desc=$([[ "$OSL_CSV" == "0" ]] && echo "max_tokens $MAX_TOKENS" || echo "OSL $OSL_CSV (ignore_eos)")
+    echo "Concurrent mode: $CONCURRENT_CSV stream(s)/server  |  $_isl_desc  |  $_osl_desc"
   fi
   for s in "${servers[@]}"; do
     IFS='|' read -r port full short <<< "$s"
@@ -283,60 +298,64 @@ print(json.dumps(servers))"
   )"
 
   HOST="$HOST" API_KEY="${API_KEY:-your-secret-key}" \
-  CONCURRENT_N="$CONCURRENT_N" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
-  ISL="$ISL" OSL="$OSL" \
+  CONCURRENT_CSV="$CONCURRENT_CSV" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
+  ISL_CSV="$ISL_CSV" OSL_CSV="$OSL_CSV" \
   python3 -u <<'PYEOF'
 import json, os, sys, time, threading, shutil
 import requests
 
 host = os.environ['HOST']
 api_key = os.environ['API_KEY']
-n = int(os.environ['CONCURRENT_N'])
-max_tokens = int(os.environ['MAX_TOKENS'])
 prompt = os.environ['PROMPT_TEXT']
 seq = os.environ.get('SEQ', '0') == '1'
-isl = int(os.environ.get('ISL', '0'))
-osl = int(os.environ.get('OSL', '0'))
+default_max_tokens = int(os.environ['MAX_TOKENS'])
 servers = json.loads(os.environ['TT_SERVERS_JSON'])
 
 headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
 
-# When --osl is given we force the model to emit exactly OSL tokens (ignore the
-# EOS token), so tok/s is measured over a fixed output length.
-force_len = osl > 0
+def _ints(csv, default):
+    csv = (csv or '').strip()
+    if not csv:
+        return [default]
+    return [int(x) for x in csv.split(',') if x.strip() != '']
 
-# Token mode (--isl): instead of generating English text and round-tripping the
-# slow /tokenize endpoint to calibrate its length, we send a raw list of token
-# IDs straight to /v1/completions. The input length is then EXACTLY `isl`
-# tokens with zero server calls and no chat-template overhead. Output is
-# non-English gibberish (we don't care — this path is for throughput numbers).
-token_mode = isl > 0
+# Each flag is a comma list; we sweep the cross product (one "datapoint" each).
+concurrency_list = _ints(os.environ.get('CONCURRENT_CSV', ''), 1)
+isl_list = _ints(os.environ.get('ISL_CSV', '0'), 0)   # 0 = English chat prompt
+osl_list = _ints(os.environ.get('OSL_CSV', '0'), 0)   # 0 = default max_tokens, EOS allowed
+combos = [(c, i, o) for c in concurrency_list for i in isl_list for o in osl_list]
+
 # An ordinary mid-vocab content token id, valid in every real model's vocab
 # (vocabs are 32k-150k+); used only as raw /v1/completions *input*, so it never
 # affects generation (output stops on max_tokens / EOS, not on input content).
 SAFE_TOKEN_ID = 1000
-token_prompt = [SAFE_TOKEN_ID] * isl if token_mode else None
 
-if token_mode:
-    print(f"Token mode: sending exactly {isl} input token(s) per stream as raw token IDs "
-          f"via /v1/completions (no /tokenize calibration; output is non-English).")
-    print()
+def make_cfg(n, isl, osl):
+    """Resolve one datapoint into a runnable config. Token mode (--isl) sends a
+    raw token-ID prompt of exactly `isl` tokens via /v1/completions (no slow
+    /tokenize calibration; output is non-English). --osl forces ignore_eos for a
+    fixed output length and wins over --max-tokens."""
+    token_mode = isl > 0
+    return {
+        'n': n, 'isl': isl, 'osl': osl,
+        'max_tokens': osl if osl > 0 else default_max_tokens,
+        'token_mode': token_mode,
+        'force_len': osl > 0,
+        'token_prompt': [SAFE_TOKEN_ID] * isl if token_mode else None,
+    }
 
 # Port-prefixed tag so identical model names on different ports are
 # distinguishable, e.g. "[8101] [Llama-3.2-3B-Instruct/1]".
 def tag_of(s):
     return f"[{s['port']}] [{s['short']}/{s['idx']}]"
 
-def make_streams(server_list):
+def make_streams(server_list, n):
     out = []
     for srv in server_list:
         for i in range(n):
             out.append({'short': srv['short'], 'full': srv['full'],
                         'port': srv['port'], 'idx': i + 1, 'of': n})
     return out
-
-# Compute tag width across ALL streams so alignment is stable across waves.
-tag_width = max(len(tag_of(s)) for s in make_streams(servers))
 
 def cols():
     # Detect the REAL terminal/pane width via the tty ioctl. Deliberately does
@@ -384,13 +403,16 @@ def fit_cells_tail(s, max_cells):
         used += cw
     return ''.join(reversed(out)), used, False
 
-def run_wave(streams):
+def run_wave(streams, cfg):
     """Run one wave of streams concurrently, redraw in place, print per-stream
-    summary. Returns the wave's wall time. Buffers/metrics are wave-local so
-    waves can run one after another (--seq)."""
+    summary. Returns (wall_time, [per-stream sample dicts that succeeded]).
+    Buffers/samples are wave-local so waves can run one after another."""
     total = len(streams)
     buffers = [''] * total
-    metrics = [None] * total
+    samples = [None] * total
+    # Tag width is wave-local: concurrency (and thus the /idx suffix width) can
+    # differ between datapoints, so alignment is computed per wave.
+    tag_width = max((len(tag_of(s)) for s in streams), default=1)
     lock = threading.Lock()
 
     def redraw():
@@ -419,25 +441,26 @@ def run_wave(streams):
         start = time.perf_counter()
         ttft = None
         token_count = 0
+        base = {'port': s['port'], 'short': s['short'], 'idx': s['idx'], 'ok': False}
         # Token mode sends exactly `isl` token IDs, so ISL is known a priori
         # (this build's /v1/completions stream omits the usage chunk). Chat mode
         # fills both in from the final usage chunk.
-        prompt_toks = isl if token_mode else None   # actual ISL
+        prompt_toks = cfg['isl'] if cfg['token_mode'] else None   # actual ISL
         completion_toks = None   # actual OSL, from response usage
         # Token mode (--isl): raw token-ID prompt to /v1/completions (exact ISL,
         # no chat template). Otherwise: English text to /v1/chat/completions.
-        if token_mode:
+        if cfg['token_mode']:
             endpoint = 'completions'
-            body = {'model': s['full'], 'prompt': token_prompt,
-                    'max_tokens': max_tokens, 'stream': True,
+            body = {'model': s['full'], 'prompt': cfg['token_prompt'],
+                    'max_tokens': cfg['max_tokens'], 'stream': True,
                     'stream_options': {'include_usage': True}}
         else:
             endpoint = 'chat/completions'
             body = {'model': s['full'],
                     'messages': [{'role': 'user', 'content': prompt}],
-                    'max_tokens': max_tokens, 'stream': True,
+                    'max_tokens': cfg['max_tokens'], 'stream': True,
                     'stream_options': {'include_usage': True}}
-        if force_len:
+        if cfg['force_len']:
             body['ignore_eos'] = True
         try:
             resp = requests.post(
@@ -464,7 +487,7 @@ def run_wave(streams):
                     continue
                 choice = choices[0]
                 # /v1/completions streams 'text'; chat streams 'delta.content'.
-                text = (choice.get('text', '') if token_mode
+                text = (choice.get('text', '') if cfg['token_mode']
                         else choice.get('delta', {}).get('content', ''))
                 finish = choice.get('finish_reason')
                 if text and ttft is None:
@@ -480,19 +503,15 @@ def run_wave(streams):
             with lock:
                 buffers[i] += f' [ERROR: {type(e).__name__}: {e}]'
                 redraw()
+            samples[i] = base
             return
         elapsed = time.perf_counter() - start
         out_toks = completion_toks if completion_toks is not None else token_count
-        if ttft and out_toks > 1:
-            tps_str = f'{(out_toks - 1) / (elapsed - ttft):.1f} tok/s'
-        else:
-            tps_str = 'n/a tok/s'
-        ttft_str = f'TTFT: {ttft*1000:.0f}ms' if ttft else 'TTFT: n/a'
-        # Show actual ISL/OSL from usage when available.
-        io_str = ''
-        if prompt_toks is not None:
-            io_str = f'ISL {prompt_toks} | OSL {out_toks} | '
-        metrics[i] = f'{io_str}{ttft_str} | {elapsed:.2f}s | {tps_str}'
+        tps = ((out_toks - 1) / (elapsed - ttft)
+               if (ttft and out_toks > 1 and elapsed > ttft) else None)
+        samples[i] = {**base, 'ok': True, 'ttft_ms': ttft * 1000 if ttft else None,
+                      'elapsed': elapsed, 'isl': prompt_toks, 'out_toks': out_toks,
+                      'tps': tps}
 
     # Reserve `total` blank lines for the redraw region.
     for s in streams:
@@ -509,22 +528,98 @@ def run_wave(streams):
 
     print()
     for i, s in enumerate(streams):
-        print(f'{tag_of(s).ljust(tag_width)} {metrics[i] if metrics[i] else "no metrics (error?)"}')
-    return we
+        smp = samples[i]
+        if smp and smp.get('ok'):
+            io = f"ISL {smp['isl']} | OSL {smp['out_toks']} | " if smp['isl'] is not None else ''
+            ttft_str = f"TTFT: {smp['ttft_ms']:.0f}ms" if smp['ttft_ms'] is not None else 'TTFT: n/a'
+            tps_str = f"{smp['tps']:.1f} tok/s" if smp['tps'] is not None else 'n/a tok/s'
+            line = f"{io}{ttft_str} | {smp['elapsed']:.2f}s | {tps_str}"
+        else:
+            line = 'no metrics (error?)'
+        print(f'{tag_of(s).ljust(tag_width)} {line}')
+    return we, [s for s in samples if s and s.get('ok')]
 
-if seq:
-    # One server at a time (its N streams still run together) so cross-server
-    # host-CPU contention (cpu_sampling) doesn't depress each server's tok/s.
-    grand = 0.0
-    for srv in servers:
-        we = run_wave(make_streams([srv]))
-        grand += we
-        print(f'--- {srv["short"]} (port {srv["port"]}) wall: {we:.2f}s ---')
+def fmt_cfg(cfg):
+    ins = (f"ISL {cfg['isl']} (token IDs)" if cfg['token_mode']
+           else f'prompt="{prompt}"')
+    outs = (f"OSL {cfg['osl']} (ignore_eos)" if cfg['force_len']
+            else f"max_tokens {cfg['max_tokens']}")
+    return f"concurrency {cfg['n']} | {ins} | {outs}"
+
+def mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+rows = []   # one aggregated row per (datapoint, server)
+
+def record(cfg, server_list, samples, wall):
+    """Aggregate a wave's per-stream samples into one row per server. agg tok/s
+    is total output tokens / wall (whole-server throughput at this concurrency);
+    tok/s/req is the mean per-stream decode rate."""
+    for srv in server_list:
+        ss = [s for s in samples if s['port'] == srv['port']]
+        if not ss:
+            continue
+        out_sum = sum(s['out_toks'] for s in ss)
+        rows.append({
+            'short': srv['short'], 'conc': cfg['n'], 'nstreams': len(ss),
+            'isl_t': cfg['isl'], 'osl_t': cfg['osl'],   # requested targets (sort keys)
+            'isl': mean([s['isl'] for s in ss]),        # measured (displayed)
+            'osl': out_sum / len(ss),
+            'ttft_ms': mean([s['ttft_ms'] for s in ss]),
+            'tps_req': mean([s['tps'] for s in ss]),
+            'tps_agg': out_sum / wall if wall > 0 else None,
+            'wall': wall,
+        })
+
+multi = len(combos) > 1
+for ci, cfg in enumerate(make_cfg(*c) for c in combos):
+    if multi:
+        print(f"########## datapoint {ci + 1}/{len(combos)}: {fmt_cfg(cfg)} ##########")
+    if seq:
+        # One server at a time (its N streams still run together) so cross-server
+        # host-CPU contention (cpu_sampling) doesn't depress each server's tok/s.
+        grand = 0.0
+        for srv in servers:
+            we, samples = run_wave(make_streams([srv], cfg['n']), cfg)
+            grand += we
+            print(f'--- {srv["short"]} (port {srv["port"]}) wall: {we:.2f}s ---')
+            print()
+            record(cfg, [srv], samples, we)
+        if len(servers) > 1:
+            print(f'=== datapoint sequential total wall: {grand:.2f}s ===')
+            print()
+    else:
+        we, samples = run_wave(make_streams(servers, cfg['n']), cfg)
+        print(f'--- wall: {we:.2f}s ---')
         print()
-    print(f'=== sequential-across-servers total wall: {grand:.2f}s ===')
-else:
-    we = run_wave(make_streams(servers))
-    print(f'--- Wall time: {we:.2f}s ---')
+        record(cfg, servers, samples, we)
+
+# Comparison table — only worth printing when there is more than one row to
+# compare (multiple datapoints and/or multiple servers).
+if len(rows) > 1:
+    def _f(v, nd):
+        return f'{v:.{nd}f}' if v is not None else '-'
+    hdr = ['model', 'conc', 'ISL', 'OSL', 'TTFT ms', 'tok/s/req', 'agg tok/s', 'wall s']
+    table = [hdr]
+    # Sort by requested targets so each (ISL,OSL) block lists concurrencies
+    # adjacently — the agg-tok/s scaling reads straight down.
+    for r in sorted(rows, key=lambda r: (r['short'], r['isl_t'], r['osl_t'], r['conc'])):
+        table.append([r['short'], str(r['conc']), _f(r['isl'], 0), _f(r['osl'], 0),
+                      _f(r['ttft_ms'], 0), _f(r['tps_req'], 1), _f(r['tps_agg'], 1),
+                      _f(r['wall'], 2)])
+    widths = [max(len(row[c]) for row in table) for c in range(len(hdr))]
+    span = sum(widths) + 3 * (len(hdr) - 1)
+    print()
+    print('=' * span)
+    print('SWEEP SUMMARY  (agg tok/s = total output tokens / wall;  tok/s/req = mean per-stream decode)')
+    print('=' * span)
+    for ri, row in enumerate(table):
+        cells = [(row[c].ljust(widths[c]) if c == 0 else row[c].rjust(widths[c]))
+                 for c in range(len(hdr))]
+        print('   '.join(cells))
+        if ri == 0:
+            print('   '.join('-' * widths[c] for c in range(len(hdr))))
 PYEOF
   exit $?
 fi
