@@ -301,7 +301,7 @@ print(json.dumps(servers))"
   CONCURRENT_CSV="$CONCURRENT_CSV" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
   ISL_CSV="$ISL_CSV" OSL_CSV="$OSL_CSV" \
   python3 -u <<'PYEOF'
-import json, os, sys, time, threading, shutil
+import json, os, sys, time, threading, shutil, random
 import requests
 
 host = os.environ['HOST']
@@ -325,10 +325,22 @@ isl_list = _ints(os.environ.get('ISL_CSV', '0'), 0)   # 0 = English chat prompt
 osl_list = _ints(os.environ.get('OSL_CSV', '0'), 0)   # 0 = default max_tokens, EOS allowed
 combos = [(c, i, o) for c in concurrency_list for i in isl_list for o in osl_list]
 
-# An ordinary mid-vocab content token id, valid in every real model's vocab
-# (vocabs are 32k-150k+); used only as raw /v1/completions *input*, so it never
-# affects generation (output stops on max_tokens / EOS, not on input content).
-SAFE_TOKEN_ID = 1000
+# Raw input token IDs are drawn from a conservative band that is valid (and
+# non-special) in every real model's vocab — the smallest LLM vocabs are 32k,
+# so ids in [1000, 21000) are always in range. Used only as /v1/completions
+# *input*, so the exact ids never affect generation (output stops on
+# max_tokens / EOS, not on input content).
+TOK_LO, TOK_BAND = 1000, 20000
+# A per-invocation salt so repeat runs cold-prefill instead of being served from
+# the server's PREFIX CACHE (identical prompts cache; an all-constant or
+# sequential prompt also makes a shorter ISL a prefix of a longer one). Seeding
+# per (run, isl) makes every ISL in a sweep a distinct sequence AND makes each
+# invocation different — so TTFT/prefill is measured cold, not from cache.
+RUN_SALT = random.Random().randrange(1 << 30)
+
+def _token_prompt(isl):
+    rng = random.Random(RUN_SALT * 1_000_003 + isl)
+    return [TOK_LO + rng.randrange(TOK_BAND) for _ in range(isl)]
 
 def make_cfg(n, isl, osl):
     """Resolve one datapoint into a runnable config. Token mode (--isl) sends a
@@ -341,7 +353,7 @@ def make_cfg(n, isl, osl):
         'max_tokens': osl if osl > 0 else default_max_tokens,
         'token_mode': token_mode,
         'force_len': osl > 0,
-        'token_prompt': [SAFE_TOKEN_ID] * isl if token_mode else None,
+        'token_prompt': _token_prompt(isl) if token_mode else None,
     }
 
 # Port-prefixed tag so identical model names on different ports are
