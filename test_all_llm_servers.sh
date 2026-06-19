@@ -85,6 +85,7 @@ ISL_CSV="0"        # comma list of input  seq lengths (tokens); 0 = use PROMPT_T
 OSL_CSV="0"        # comma list of output seq lengths (tokens); 0 = use MAX_TOKENS, EOS allowed
 REP_PENALTY_FLAG="${REP_PENALTY:-}"   # repetition_penalty to send; empty = let server default apply
 TEMPERATURE_FLAG="${TEMPERATURE:-}"   # temperature to send; empty = let server default apply
+SEED_FLAG="${SEED:-}"                 # seed to send; empty = no seed (unseeded fast path)
 
 # Parse args. Recognized flags: --health | --concurrent N | --max-tokens N.
 # A bare positional (no leading --) is taken as the prompt text and only makes
@@ -164,6 +165,19 @@ while [[ $# -gt 0 ]]; do
       fi
       TEMPERATURE_FLAG="$1"
       shift ;;
+    --seed)
+      # seed to send on every request (non-negative integer). Unset => no seed
+      # is sent (the fast unseeded path). NOTE: on the TT device sampler a seed
+      # does NOT make output deterministic (tt-xla#4539) yet still forces the
+      # slow seeded sampling path (~5x decode); use this only to reproduce/A-B
+      # that cost. See SCOPE_seeded_qsamples_perstep_cost.md.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --seed requires a non-negative integer (e.g. --seed 42)" >&2
+        exit 2
+      fi
+      SEED_FLAG="$1"
+      shift ;;
     --ports)
       # Use explicit, comma-separated host ports instead of discovering
       # docker containers (e.g. --ports 8101,8102). Works for non-container
@@ -177,7 +191,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --*)
       echo "ERROR: unknown flag: $1" >&2
-      echo "Usage: $0 [--health | --concurrent N[,N...] [--seq] [--max-tokens N] [--isl N[,N...]] [--osl N[,N...]] [--rep-penalty F] [--temperature F] [PROMPT]] [--ports P1,P2,...]" >&2
+      echo "Usage: $0 [--health | --concurrent N[,N...] [--seq] [--max-tokens N] [--isl N[,N...]] [--osl N[,N...]] [--rep-penalty F] [--temperature F] [--seed N] [PROMPT]] [--ports P1,P2,...]" >&2
       exit 2 ;;
     *)
       # Bare arg: treat as prompt text (concurrent mode only).
@@ -329,7 +343,7 @@ print(json.dumps(servers))"
   HOST="$HOST" API_KEY="${API_KEY:-your-secret-key}" \
   CONCURRENT_CSV="$CONCURRENT_CSV" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
   ISL_CSV="$ISL_CSV" OSL_CSV="$OSL_CSV" \
-  REP_PENALTY="$REP_PENALTY_FLAG" TEMPERATURE="$TEMPERATURE_FLAG" \
+  REP_PENALTY="$REP_PENALTY_FLAG" TEMPERATURE="$TEMPERATURE_FLAG" SEED="$SEED_FLAG" \
   python3 -u <<'PYEOF'
 import json, os, sys, time, threading, shutil, random
 import requests
@@ -346,6 +360,10 @@ servers = json.loads(os.environ['TT_SERVERS_JSON'])
 # see issue #4278). Lets you A/B e.g. 1.1 vs 1.0.
 rep_penalty = os.environ.get('REP_PENALTY') or None
 temperature = os.environ.get('TEMPERATURE') or None
+# --seed (or SEED env): when set, send seed on every request. Empty -> no seed.
+# WARNING: on the TT device sampler a seed is NOT honored (tt-xla#4539) but still
+# triggers the slow seeded sampling path (~5x decode); for A/B only.
+seed = os.environ.get('SEED') or None
 
 headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
 
@@ -514,6 +532,8 @@ def run_wave(streams, cfg):
             body['repetition_penalty'] = float(rep_penalty)
         if temperature is not None:
             body['temperature'] = float(temperature)
+        if seed is not None:
+            body['seed'] = int(seed)
         try:
             resp = requests.post(
                 f"http://{host}:{s['port']}/v1/{endpoint}",
@@ -635,7 +655,10 @@ for ci, cfg in enumerate(make_cfg(*c) for c in combos):
         for srv in servers:
             we, samples = run_wave(make_streams([srv], cfg['n']), cfg)
             grand += we
-            print(f'--- {srv["short"]} (port {srv["port"]}) wall: {we:.2f}s ---')
+            # With a single stream the per-stream line already prints the wall;
+            # only show the per-server wall line when N>1 streams are aggregated.
+            if cfg['n'] > 1:
+                print(f'--- {srv["short"]} (port {srv["port"]}) wall: {we:.2f}s ---')
             print()
             record(cfg, [srv], samples, we)
         if len(servers) > 1:
@@ -643,7 +666,10 @@ for ci, cfg in enumerate(make_cfg(*c) for c in combos):
             print()
     else:
         we, samples = run_wave(make_streams(servers, cfg['n']), cfg)
-        print(f'--- wall: {we:.2f}s ---')
+        # Redundant when there's only one stream total (1 server, N=1): the
+        # per-stream line already shows the wall.
+        if len(servers) * cfg['n'] > 1:
+            print(f'--- wall: {we:.2f}s ---')
         print()
         record(cfg, servers, samples, we)
 
