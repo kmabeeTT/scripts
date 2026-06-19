@@ -31,6 +31,12 @@
 #                                                                   # × OSL (here 8 points);
 #                                                                   # prints a comparison
 #                                                                   # table at the end
+#   ./test_all_llm_servers.sh --concurrent 1 --osl 1024 \
+#       --rep-penalty 1.0                                           # send repetition_penalty
+#                                                                   # explicitly (1.0 disables
+#                                                                   # it; unset => server
+#                                                                   # default, e.g. 1.1)
+#   ./test_all_llm_servers.sh --concurrent 1 --osl 1024 --temperature 0  # send temperature
 #   ./test_all_llm_servers.sh --concurrent 1 --ports 8101,8102      # use explicit ports
 #                                                                   # instead of docker
 #                                                                   # discovery (models found
@@ -77,6 +83,8 @@ SEQ=0
 PORTS_CSV=""
 ISL_CSV="0"        # comma list of input  seq lengths (tokens); 0 = use PROMPT_TEXT as-is
 OSL_CSV="0"        # comma list of output seq lengths (tokens); 0 = use MAX_TOKENS, EOS allowed
+REP_PENALTY_FLAG="${REP_PENALTY:-}"   # repetition_penalty to send; empty = let server default apply
+TEMPERATURE_FLAG="${TEMPERATURE:-}"   # temperature to send; empty = let server default apply
 
 # Parse args. Recognized flags: --health | --concurrent N | --max-tokens N.
 # A bare positional (no leading --) is taken as the prompt text and only makes
@@ -135,6 +143,27 @@ while [[ $# -gt 0 ]]; do
       # (cpu_sampling runs on the host) doesn't depress each server's tok/s.
       SEQ=1
       shift ;;
+    --rep-penalty)
+      # repetition_penalty to send on every request (float, e.g. 1.0 or 1.1).
+      # Unset => server default applies (tt-media-server defaults 1.1, which
+      # triggers O(N^2) decode; see issue #4278). Use 1.0 to disable it.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: --rep-penalty requires a non-negative number (e.g. --rep-penalty 1.0)" >&2
+        exit 2
+      fi
+      REP_PENALTY_FLAG="$1"
+      shift ;;
+    --temperature|--temp)
+      # temperature to send on every request (float, e.g. 0 or 0.6). Unset =>
+      # server default applies.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: --temperature requires a non-negative number (e.g. --temperature 0)" >&2
+        exit 2
+      fi
+      TEMPERATURE_FLAG="$1"
+      shift ;;
     --ports)
       # Use explicit, comma-separated host ports instead of discovering
       # docker containers (e.g. --ports 8101,8102). Works for non-container
@@ -148,7 +177,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --*)
       echo "ERROR: unknown flag: $1" >&2
-      echo "Usage: $0 [--health | --concurrent N[,N...] [--seq] [--max-tokens N] [--isl N[,N...]] [--osl N[,N...]] [PROMPT]] [--ports P1,P2,...]" >&2
+      echo "Usage: $0 [--health | --concurrent N[,N...] [--seq] [--max-tokens N] [--isl N[,N...]] [--osl N[,N...]] [--rep-penalty F] [--temperature F] [PROMPT]] [--ports P1,P2,...]" >&2
       exit 2 ;;
     *)
       # Bare arg: treat as prompt text (concurrent mode only).
@@ -300,6 +329,7 @@ print(json.dumps(servers))"
   HOST="$HOST" API_KEY="${API_KEY:-your-secret-key}" \
   CONCURRENT_CSV="$CONCURRENT_CSV" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
   ISL_CSV="$ISL_CSV" OSL_CSV="$OSL_CSV" \
+  REP_PENALTY="$REP_PENALTY_FLAG" TEMPERATURE="$TEMPERATURE_FLAG" \
   python3 -u <<'PYEOF'
 import json, os, sys, time, threading, shutil, random
 import requests
@@ -310,6 +340,12 @@ prompt = os.environ['PROMPT_TEXT']
 seq = os.environ.get('SEQ', '0') == '1'
 default_max_tokens = int(os.environ['MAX_TOKENS'])
 servers = json.loads(os.environ['TT_SERVERS_JSON'])
+# --rep-penalty / --temperature (or REP_PENALTY / TEMPERATURE env): when set, send
+# the value explicitly on every request. Empty -> server default applies
+# (tt-media-server defaults repetition_penalty=1.1, which triggers O(N^2) decode;
+# see issue #4278). Lets you A/B e.g. 1.1 vs 1.0.
+rep_penalty = os.environ.get('REP_PENALTY') or None
+temperature = os.environ.get('TEMPERATURE') or None
 
 headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
 
@@ -474,6 +510,10 @@ def run_wave(streams, cfg):
                     'stream_options': {'include_usage': True}}
         if cfg['force_len']:
             body['ignore_eos'] = True
+        if rep_penalty is not None:
+            body['repetition_penalty'] = float(rep_penalty)
+        if temperature is not None:
+            body['temperature'] = float(temperature)
         try:
             resp = requests.post(
                 f"http://{host}:{s['port']}/v1/{endpoint}",
