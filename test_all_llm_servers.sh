@@ -86,6 +86,8 @@ OSL_CSV="0"        # comma list of output seq lengths (tokens); 0 = use MAX_TOKE
 REP_PENALTY_FLAG="${REP_PENALTY:-}"   # repetition_penalty to send; empty = let server default apply
 TEMPERATURE_FLAG="${TEMPERATURE:-}"   # temperature to send; empty = let server default apply
 SEED_FLAG="${SEED:-}"                 # seed to send; empty = no seed (unseeded fast path)
+REQ_TIMEOUT_FLAG="${REQ_TIMEOUT:-1800}"  # per-request read timeout (s); large-ISL cold compiles exceed the old 300s
+RAMP_FLAG="${RAMP:-0}"                    # ms to stagger concurrent stream launches (0 = all-at-once burst)
 
 # Parse args. Recognized flags: --health | --concurrent N | --max-tokens N.
 # A bare positional (no leading --) is taken as the prompt text and only makes
@@ -177,6 +179,29 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       SEED_FLAG="$1"
+      shift ;;
+    --timeout)
+      # per-request read timeout in seconds (default 1800). Raise for large-ISL
+      # runs whose first request triggers a cold prefill compile (the old fixed
+      # 300s killed conc-1 ISL>=16k before TTFT). Lower it to fail fast.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --timeout requires a positive integer (seconds, e.g. --timeout 1800)" >&2
+        exit 2
+      fi
+      REQ_TIMEOUT_FLAG="$1"
+      shift ;;
+    --ramp)
+      # Stagger concurrent stream launches by N ms instead of firing all at t=0.
+      # Avoids the synchronized prefill stampede (chunked-prefill backlog) so the
+      # decode/TTFT numbers reflect steady-state serving rather than a thundering
+      # herd. 0 (default) = burst. Has no effect at --concurrent 1.
+      shift
+      if [[ $# -eq 0 || ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --ramp requires a non-negative integer (ms, e.g. --ramp 250)" >&2
+        exit 2
+      fi
+      RAMP_FLAG="$1"
       shift ;;
     --ports)
       # Use explicit, comma-separated host ports instead of discovering
@@ -344,8 +369,9 @@ print(json.dumps(servers))"
   CONCURRENT_CSV="$CONCURRENT_CSV" MAX_TOKENS="$MAX_TOKENS" PROMPT_TEXT="$PROMPT_TEXT" SEQ="$SEQ" \
   ISL_CSV="$ISL_CSV" OSL_CSV="$OSL_CSV" \
   REP_PENALTY="$REP_PENALTY_FLAG" TEMPERATURE="$TEMPERATURE_FLAG" SEED="$SEED_FLAG" \
+  REQ_TIMEOUT="$REQ_TIMEOUT_FLAG" RAMP="$RAMP_FLAG" \
   python3 -u <<'PYEOF'
-import json, os, sys, time, threading, shutil, random
+import json, os, re, sys, time, threading, shutil, random, statistics
 import requests
 
 host = os.environ['HOST']
@@ -364,6 +390,14 @@ temperature = os.environ.get('TEMPERATURE') or None
 # WARNING: on the TT device sampler a seed is NOT honored (tt-xla#4539) but still
 # triggers the slow seeded sampling path (~5x decode); for A/B only.
 seed = os.environ.get('SEED') or None
+# Per-request read timeout (s). The old fixed 300s killed conc-1 large-ISL runs
+# whose first request pays a cold prefill compile (TTFT > 300s) before any token.
+req_timeout = float(os.environ.get('REQ_TIMEOUT') or 1800)
+ramp_s = float(os.environ.get('RAMP') or 0) / 1000.0  # stagger between stream launches
+# Strip ALL control/escape chars from streamed text before the in-place redraw:
+# generated garbage (esp. at large random-token ISL) can contain ESC / C0 / C1
+# bytes that corrupt the cursor-up math and flood the screen.
+_CTRL = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 
 headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
 
@@ -392,8 +426,13 @@ TOK_LO, TOK_BAND = 1000, 20000
 # invocation different — so TTFT/prefill is measured cold, not from cache.
 RUN_SALT = random.Random().randrange(1 << 30)
 
-def _token_prompt(isl):
-    rng = random.Random(RUN_SALT * 1_000_003 + isl)
+def _token_prompt(isl, uniq=""):
+    # Seed per (run, isl, uniq) so EVERY request gets a distinct sequence — across
+    # ISLs, across concurrency levels, AND across streams within a wave. Without
+    # the uniq key, conc 1/16/32 at the same ISL shared one prompt, so the conc=1
+    # datapoint (first under --seq) warmed the PREFIX CACHE and the conc=16/32
+    # datapoints read warm KV -> bogus (too-low) TTFT.
+    rng = random.Random(f"{RUN_SALT}:{isl}:{uniq}")
     return [TOK_LO + rng.randrange(TOK_BAND) for _ in range(isl)]
 
 def make_cfg(n, isl, osl):
@@ -407,7 +446,8 @@ def make_cfg(n, isl, osl):
         'max_tokens': osl if osl > 0 else default_max_tokens,
         'token_mode': token_mode,
         'force_len': osl > 0,
-        'token_prompt': _token_prompt(isl) if token_mode else None,
+        # Prompts are built per-stream in run_wave (unique per concurrency+idx),
+        # not shared here — otherwise prefix caching fakes TTFT across datapoints.
     }
 
 # Port-prefixed tag so identical model names on different ports are
@@ -476,12 +516,26 @@ def run_wave(streams, cfg):
     total = len(streams)
     buffers = [''] * total
     samples = [None] * total
+    # One UNIQUE prompt per stream (keyed by concurrency + stream idx) so prefix
+    # caching can't serve warmed KV across streams or earlier datapoints (which
+    # faked TTFT). Pre-built before launch so dispatch isn't staggered by gen.
+    prompts = ([_token_prompt(cfg['isl'], (cfg['n'], s['idx'])) for s in streams]
+               if cfg['token_mode'] else [None] * total)
     # Tag width is wave-local: concurrency (and thus the /idx suffix width) can
     # differ between datapoints, so alignment is computed per wave.
     tag_width = max((len(tag_of(s)) for s in streams), default=1)
     lock = threading.Lock()
 
-    def redraw():
+    _last_draw = [0.0]
+
+    def redraw(force=False):
+        # Coalesce repaints: at high concurrency every token from every stream
+        # would otherwise trigger a full N-line repaint (thousands/sec) -> flood
+        # and flicker. Cap to ~20 Hz; callers force a final repaint after join.
+        now = time.perf_counter()
+        if not force and now - _last_draw[0] < 0.05:
+            return
+        _last_draw[0] = now
         sys.stdout.write(f'\033[{total}A')
         width = cols()
         for i, s in enumerate(streams):
@@ -493,7 +547,7 @@ def run_wave(streams, cfg):
             # Sized by DISPLAY width (CJK glyphs are 2 cells) so the line can
             # never wrap — wrapping would break the \033[A cursor-up redraw.
             max_cells = width - tag_width - 2
-            text = buffers[i].replace('\n', ' ').replace('\r', ' ')
+            text = _CTRL.sub(' ', buffers[i])
             if max_cells > 1:
                 # Reserve 1 cell for the leading '…' when we've truncated.
                 fitted, _, trunc = fit_cells_tail(text, max_cells - 1)
@@ -507,6 +561,8 @@ def run_wave(streams, cfg):
         start = time.perf_counter()
         ttft = None
         token_count = 0
+        itls = []          # inter-token gaps (s) -> TPOT / steady-state decode rate
+        prev_tok = None
         base = {'port': s['port'], 'short': s['short'], 'idx': s['idx'], 'ok': False}
         # Token mode sends exactly `isl` token IDs, so ISL is known a priori
         # (this build's /v1/completions stream omits the usage chunk). Chat mode
@@ -517,7 +573,7 @@ def run_wave(streams, cfg):
         # no chat template). Otherwise: English text to /v1/chat/completions.
         if cfg['token_mode']:
             endpoint = 'completions'
-            body = {'model': s['full'], 'prompt': cfg['token_prompt'],
+            body = {'model': s['full'], 'prompt': prompts[i],
                     'max_tokens': cfg['max_tokens'], 'stream': True,
                     'stream_options': {'include_usage': True}}
         else:
@@ -537,7 +593,7 @@ def run_wave(streams, cfg):
         try:
             resp = requests.post(
                 f"http://{host}:{s['port']}/v1/{endpoint}",
-                headers=headers, json=body, stream=True, timeout=300)
+                headers=headers, json=body, stream=True, timeout=req_timeout)
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith('data: '):
@@ -562,9 +618,13 @@ def run_wave(streams, cfg):
                 text = (choice.get('text', '') if cfg['token_mode']
                         else choice.get('delta', {}).get('content', ''))
                 finish = choice.get('finish_reason')
-                if text and ttft is None:
-                    ttft = time.perf_counter() - start
                 if text:
+                    now = time.perf_counter()
+                    if ttft is None:
+                        ttft = now - start          # first token = prefill latency
+                    elif prev_tok is not None:
+                        itls.append(now - prev_tok)  # decode inter-token gap
+                    prev_tok = now
                     token_count += 1
                     with lock:
                         buffers[i] += text
@@ -579,11 +639,16 @@ def run_wave(streams, cfg):
             return
         elapsed = time.perf_counter() - start
         out_toks = completion_toks if completion_toks is not None else token_count
-        tps = ((out_toks - 1) / (elapsed - ttft)
-               if (ttft and out_toks > 1 and elapsed > ttft) else None)
+        # Steady-state decode: TPOT = median inter-token gap; decode tok/s = 1/TPOT.
+        # Robust to prefill-backlog stalls that confound (out-1)/(elapsed-ttft).
+        tpot = statistics.median(itls) if itls else None
+        decode_tps = (1.0 / tpot) if tpot else None
+        # Prefill throughput: prompt tokens prefilled per second of TTFT.
+        prefill_tps = (prompt_toks / ttft) if (ttft and prompt_toks) else None
         samples[i] = {**base, 'ok': True, 'ttft_ms': ttft * 1000 if ttft else None,
                       'elapsed': elapsed, 'isl': prompt_toks, 'out_toks': out_toks,
-                      'tps': tps}
+                      'tpot_ms': tpot * 1000 if tpot else None,
+                      'decode_tps': decode_tps, 'prefill_tps': prefill_tps}
 
     # Reserve `total` blank lines for the redraw region.
     for s in streams:
@@ -592,11 +657,14 @@ def run_wave(streams, cfg):
 
     threads = [threading.Thread(target=run_stream, args=(i, s)) for i, s in enumerate(streams)]
     ws = time.perf_counter()
-    for t in threads:
+    for j, t in enumerate(threads):
         t.start()
+        if ramp_s and j < len(threads) - 1:
+            time.sleep(ramp_s)   # stagger launches to avoid a synchronized prefill stampede
     for t in threads:
         t.join()
     we = time.perf_counter() - ws
+    redraw(force=True)  # ensure the final token state is painted (throttle may have skipped it)
 
     print()
     for i, s in enumerate(streams):
@@ -604,8 +672,10 @@ def run_wave(streams, cfg):
         if smp and smp.get('ok'):
             io = f"ISL {smp['isl']} | OSL {smp['out_toks']} | " if smp['isl'] is not None else ''
             ttft_str = f"TTFT: {smp['ttft_ms']:.0f}ms" if smp['ttft_ms'] is not None else 'TTFT: n/a'
-            tps_str = f"{smp['tps']:.1f} tok/s" if smp['tps'] is not None else 'n/a tok/s'
-            line = f"{io}{ttft_str} | {smp['elapsed']:.2f}s | {tps_str}"
+            pf_str = f"prefill {smp['prefill_tps']:.0f} tok/s" if smp['prefill_tps'] is not None else 'prefill n/a'
+            dec_str = (f"decode {smp['decode_tps']:.1f} tok/s ({smp['tpot_ms']:.0f}ms TPOT)"
+                       if smp['decode_tps'] is not None else 'decode n/a')
+            line = f"{io}{ttft_str} | {pf_str} | {dec_str} | {smp['elapsed']:.2f}s"
         else:
             line = 'no metrics (error?)'
         print(f'{tag_of(s).ljust(tag_width)} {line}')
@@ -622,6 +692,14 @@ def mean(xs):
     xs = [x for x in xs if x is not None]
     return sum(xs) / len(xs) if xs else None
 
+def _pct(xs, p):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * p / 100.0
+    lo = int(k); hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
 rows = []   # one aggregated row per (datapoint, server)
 
 def record(cfg, server_list, samples, wall):
@@ -631,16 +709,31 @@ def record(cfg, server_list, samples, wall):
     for srv in server_list:
         ss = [s for s in samples if s['port'] == srv['port']]
         if not ss:
+            # No successful streams (all errored/timed out). Record a visible
+            # FAILED row instead of silently dropping the datapoint.
+            rows.append({
+                'short': srv['short'], 'conc': cfg['n'], 'nstreams': 0,
+                'isl_t': cfg['isl'], 'osl_t': cfg['osl'],
+                'isl': cfg['isl'], 'osl': cfg['osl'],
+                'ttft_p50': None, 'ttft_p90': None, 'ttft_max': None,
+                'prefill_tps': None, 'decode_tps': None, 'tps_agg': None,
+                'wall': wall, 'failed': True,
+            })
             continue
         out_sum = sum(s['out_toks'] for s in ss)
+        ttfts = [s['ttft_ms'] for s in ss if s['ttft_ms'] is not None]
         rows.append({
             'short': srv['short'], 'conc': cfg['n'], 'nstreams': len(ss),
             'isl_t': cfg['isl'], 'osl_t': cfg['osl'],   # requested targets (sort keys)
             'isl': mean([s['isl'] for s in ss]),        # measured (displayed)
             'osl': out_sum / len(ss),
-            'ttft_ms': mean([s['ttft_ms'] for s in ss]),
-            'tps_req': mean([s['tps'] for s in ss]),
-            'tps_agg': out_sum / wall if wall > 0 else None,
+            # Prefill: TTFT spread (p50/p90/max exposes the chunked-prefill backlog).
+            'ttft_p50': _pct(ttfts, 50), 'ttft_p90': _pct(ttfts, 90),
+            'ttft_max': max(ttfts) if ttfts else None,
+            'prefill_tps': mean([s['prefill_tps'] for s in ss]),
+            # Decode: steady-state per-user rate (1/median-ITL), mean across streams.
+            'decode_tps': mean([s['decode_tps'] for s in ss]),
+            'tps_agg': out_sum / wall if wall > 0 else None,   # whole-system throughput
             'wall': wall,
         })
 
@@ -678,19 +771,27 @@ for ci, cfg in enumerate(make_cfg(*c) for c in combos):
 if len(rows) > 1:
     def _f(v, nd):
         return f'{v:.{nd}f}' if v is not None else '-'
-    hdr = ['model', 'conc', 'ISL', 'OSL', 'TTFT ms', 'tok/s/req', 'agg tok/s', 'wall s']
+    hdr = ['model', 'conc', 'ISL', 'OSL',
+           'TTFT p50', 'TTFT p90', 'TTFT max', 'prefill t/s', 'decode t/s',
+           'agg t/s', 'wall s']
     table = [hdr]
     # Sort by requested targets so each (ISL,OSL) block lists concurrencies
     # adjacently — the agg-tok/s scaling reads straight down.
     for r in sorted(rows, key=lambda r: (r['short'], r['isl_t'], r['osl_t'], r['conc'])):
-        table.append([r['short'], str(r['conc']), _f(r['isl'], 0), _f(r['osl'], 0),
-                      _f(r['ttft_ms'], 0), _f(r['tps_req'], 1), _f(r['tps_agg'], 1),
-                      _f(r['wall'], 2)])
+        if r.get('failed'):
+            table.append([r['short'], str(r['conc']), _f(r['isl'], 0), _f(r['osl'], 0),
+                          'FAIL', 'FAIL', 'FAIL', 'FAIL', 'FAIL', 'FAIL', _f(r['wall'], 2)])
+        else:
+            table.append([r['short'], str(r['conc']), _f(r['isl'], 0), _f(r['osl'], 0),
+                          _f(r['ttft_p50'], 0), _f(r['ttft_p90'], 0), _f(r['ttft_max'], 0),
+                          _f(r['prefill_tps'], 0), _f(r['decode_tps'], 1),
+                          _f(r['tps_agg'], 1), _f(r['wall'], 2)])
     widths = [max(len(row[c]) for row in table) for c in range(len(hdr))]
     span = sum(widths) + 3 * (len(hdr) - 1)
     print()
     print('=' * span)
-    print('SWEEP SUMMARY  (agg tok/s = total output tokens / wall;  tok/s/req = mean per-stream decode)')
+    print('SWEEP SUMMARY  (TTFT p50/p90/max = prefill latency spread; prefill t/s = ISL/TTFT;')
+    print('               decode t/s = steady-state 1/median-inter-token; agg t/s = total out toks / wall)')
     print('=' * span)
     for ri, row in enumerate(table):
         cells = [(row[c].ljust(widths[c]) if c == 0 else row[c].rjust(widths[c]))
