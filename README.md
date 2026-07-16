@@ -409,6 +409,25 @@ Distinct model names: 13
 
 ---
 
+### 🧹 stale-tests.sh
+**Find and report stale pytest/python/test processes, and stale processes holding TCP listen ports**
+
+```bash
+./stale-tests.sh                        # default report, 15 min staleness threshold
+./stale-tests.sh --min-minutes 30       # only flag long-running ones over 30 min
+./stale-tests.sh --all                  # also list unflagged matches (sanity-check the pattern)
+./stale-tests.sh --no-ports             # skip the port-holder section, test-only
+./stale-tests.sh --kill                 # interactively offer to kill -9 each flagged process
+```
+
+**Output**: Two sections. (1) `pytest`/`python*` processes whose command line mentions "test", flagged as `ZOMBIE`, `STOPPED`, `ORPHANED`, and/or `LONG-RUNNING`. (2) Any process (regardless of name) holding an open TCP listen socket, same staleness flags — catches a leftover front-end (`uvicorn`, `vllm serve`, etc.) or its orphaned engine child still squatting a port after a crash. Both sections cross-reference whether a flagged process is also holding a Tenstorrent device (see `tt-devs.sh`).
+
+**Use when**: A new server won't start (e.g. "address already in use") and you need to find what's still holding the port, or you want to sweep up abandoned test/repro runs before they pile up as zombies or hold a device idle.
+
+**Note**: Read-only by default; `--kill` always prompts per-process (default no) before killing anything. Doesn't currently flag a stale process that's holding a TT device but not a port and doesn't match the pytest/python name pattern (e.g. an orphaned `VLLM::EngineCore` with no live front-end) — `tt-devs.sh` lists all device holders unconditionally if you need that.
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
