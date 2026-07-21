@@ -45,6 +45,12 @@
 # API key is "your-secret-key".
 set -e
 
+# A tt-xla venv's PYTHONPATH makes tt-xla's own tests/utils.py shadow
+# tt-inference-server-2's utils/url_helpers.py ("ModuleNotFoundError: No
+# module named 'jax.lax'" from tt-xla's tests/utils.py, not the real error).
+# Equivalent to always invoking this script as `env -u PYTHONPATH ...`.
+unset PYTHONPATH
+
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit "${1:-0}"; }
 
 MODEL="Llama-3.1-8B-Instruct"; PORT="8012"; DEVICE="p150"
