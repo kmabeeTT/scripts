@@ -428,6 +428,24 @@ Distinct model names: 13
 
 ---
 
+### 🔬 gdb_debug_hang.sh
+**Diagnose a hung/stuck native process (e.g. a wedged `VLLM::EngineCore`) with one command**
+
+```bash
+./gdb_debug_hang.sh                                   # auto-find the VLLM::EngineCore, 3s sample
+./gdb_debug_hang.sh --pid 3794128                     # target a specific PID
+./gdb_debug_hang.sh --pattern "some_other_process"    # auto-find via a different pgrep -f pattern
+./gdb_debug_hang.sh --sample-secs 5 --top 3           # longer sample, dump top 3 hot threads
+```
+
+**Output**: (1) A per-thread CPU-time delta sample (`/proc/<pid>/task/*/stat`, `sample-secs` apart) that isolates which thread(s), if any, are actively spinning vs. genuinely idle — a real native-level hang shows one thread pegged near 100% while everything else is flat. (2) A full `py-spy dump` for Python-level stacks (which request/code path is blocked). (3) A `gdb -batch -ex "thread apply all bt"` native backtrace, filtered down to just the hot thread(s) found in step 1. (4) Which `/dev/tenstorrent/*` device(s) the target holds.
+
+**Use when**: A server (or standalone repro) appears stuck/hung and you need to tell a genuine native-level stall (e.g. a TT device completion-queue wait that never returns, `FDMeshCommandQueue::read_completion_queue`) apart from a Python-level deadlock (e.g. a scheduler lock) — the CPU-delta step tells you which layer to even look at before you dig further.
+
+**Note**: Needs passwordless `sudo -n gdb`/`sudo -n py-spy` (ptrace access). `py-spy` path defaults to `~/tt-xla/venv/bin/py-spy`; override with `PY_SPY=/path/to/py-spy`. If no thread accumulates CPU time during the sample window, the process is fully idle/blocked rather than spinning — gdb is skipped (nothing to target) and the py-spy dump is usually enough to see where everything is parked.
+
+---
+
 ## Model Server Scripts (`model_servers/`)
 
 Launch forge LLM servers via `run.py` and drive evals against them, matching tt-inference-server's CI config exactly. Currently Falcon3-7B-Instruct; more models to follow the same naming pattern (`launch_<model>_docker.sh`, `launch_<model>_uvicorn.sh`).
