@@ -428,6 +428,68 @@ Distinct model names: 13
 
 ---
 
+## Model Server Scripts (`model_servers/`)
+
+Launch forge LLM servers via `run.py` and drive evals against them, matching tt-inference-server's CI config exactly. Currently Falcon3-7B-Instruct; more models to follow the same naming pattern (`launch_<model>_docker.sh`, `launch_<model>_uvicorn.sh`).
+
+Both launch scripts default `TT_INFERENCE_SERVER_ROOT` to `~/tt-inference-server-2`; override the env var to target a different checkout. Logs are written to `~/scripts/*.log` (gitignored) with timestamped names.
+
+### 🐳 model_servers/launch_falcon3_7b_instruct_docker.sh
+**Launch Falcon3-7B-Instruct via `run.py --docker-server`, matching CI**
+
+```bash
+./model_servers/launch_falcon3_7b_instruct_docker.sh                     # defaults: device 0, port 8010
+DEVICE_ID=1 SERVICE_PORT=8011 ./model_servers/launch_falcon3_7b_instruct_docker.sh
+```
+
+**Output**: Pulls/launches the pinned CI docker image (no `--vllm-override-args` — letting `run.py` resolve `cnn.yaml`'s default forge P150 spec unmodified reproduces CI exactly: b32, 32768 ctx, gmu=0.35, opt=1, bfp8 KV, chunk=1024, b1-prefill). Runs detached; the script returns once the container is confirmed started, it does not block for the life of the server.
+
+**Use when**: You want to iterate on a model locally exactly as it runs on CI, without a tt-xla venv (this runs outside any PJRT venv on the host — docker handles it).
+
+**Requires**: `TT_VISIBLE_DEVICES` and `TT_MESH_GRAPH_DESC_PATH` set in `$TT_INFERENCE_SERVER_ROOT/.env` (gitignored, host-local, loaded via `--env-file`) — the container's own auto-mesh-descriptor logic only fires for Whisper/SpeechT5-TTS runners, not LLM/`vllm_forge`. Paths are *inside* the container (confirmed via `docker inspect <image>` + `find` inside the image), not the host, e.g.:
+```
+TT_VISIBLE_DEVICES=0
+TT_MESH_GRAPH_DESC_PATH=/home/container_app_user/app/server/venv-worker/lib/python3.12/site-packages/pjrt_plugin_tt/tt-metal/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto
+```
+
+---
+
+### 🖥️ model_servers/launch_falcon3_7b_instruct_uvicorn.sh
+**Launch Falcon3-7B-Instruct bare-metal, direct uvicorn (no docker)**
+
+```bash
+cd ~/tt-xla && source venv/activate
+~/scripts/model_servers/launch_falcon3_7b_instruct_uvicorn.sh              # default port 8019, chip (0)
+PORT=8020 DEVICE_IDS='(1)' ~/scripts/model_servers/launch_falcon3_7b_instruct_uvicorn.sh
+```
+
+**Output**: Same settings as the docker launcher (verified directly against `workflows/model_specs/dev/cnn.yaml`'s Falcon3-7B-Instruct/P150 spec), started via `uvicorn main:app` in the foreground, streamed to a log file.
+
+**Use when**: You want faster iteration than a docker rebuild/pull cycle, or need to attach a debugger/profiler to the process directly.
+
+**Requires**: Must run from a tt-xla venv (`cd ~/tt-xla && source venv/activate` first) — `TT_METAL_HOME` and the mesh descriptor path resolve from `$(pwd)`. Uses `~/tt-xla`, not `~/tt-xla-2` (which has no `tt-metal` symlink at its root).
+
+---
+
+### 📈 model_servers/run_evals_forge.sh
+**Run a forge LLM's evals against an already-running server, via `run.py --workflow evals`**
+
+Copied from tt-inference-server commit [`517210492`](https://github.com/tenstorrent/tt-inference-server/commit/517210492), adapted only to `cd` into `$TT_INFERENCE_SERVER_ROOT` instead of its own dirname.
+
+```bash
+~/scripts/model_servers/run_evals_forge.sh --model Falcon3-7B-Instruct --port 8010                  # all tasks, ci-nightly (default)
+~/scripts/model_servers/run_evals_forge.sh --model Falcon3-7B-Instruct --port 8010 --mode smoke-test # all tasks, ~1% fast smoke
+~/scripts/model_servers/run_evals_forge.sh --model Falcon3-7B-Instruct --port 8010 --task ifeval --samples all
+```
+
+**Output**: Drives `run.py --workflow evals`, which reads the model's `EvalConfig` and handles both eval code paths (`meta_*` via `EVALS_META`, `longbench_*`/`mmlu_pro`/`gpqa` via `EVALS_COMMON` lm-eval-harness) — a plain `lm_eval` one-liner can't reproduce the `meta_*` tasks.
+
+**Use when**: You have a server up (either launcher above) and want to reproduce CI's eval scoring locally, at full size or downsampled.
+
+**Note**: `meta_*`/`gpqa` tasks need HF access (`HF_TOKEN`); `longbench_*`/`mmlu_pro` are open. Full `--help` via `-h`.
+
+---
+
 ## Typical Workflow
 
 ### 1. Run Test with IR Dumps
