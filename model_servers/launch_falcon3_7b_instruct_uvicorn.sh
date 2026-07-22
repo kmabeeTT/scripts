@@ -5,8 +5,21 @@
 # Falcon3-7B-Instruct single-chip forge LLM launcher (bare-metal, direct
 # uvicorn -- no docker), mirroring the CI/production config in
 # workflows/model_specs/dev/cnn.yaml (forge P150 spec, verified against it
-# directly): b32, 32768 ctx, chunk 1024, gmu 0.35, bfp8 weights+KV, opt=1,
-# device sampling, trace, b1-prefill. Pinned to chip 0.
+# directly): b32, 32768 ctx, chunk 1024, gmu 0.35, opt=1, device sampling,
+# trace, b1-prefill. Pinned to chip 0.
+#
+# Weights/KV cache default to bf16 here, NOT CI's bfp8 -- this diverges from
+# cnn.yaml intentionally for local bf16 iteration. Pass
+# WEIGHT_DTYPE=bfp_bf8/KV_CACHE_DTYPE=bfp_bf8 to match CI exactly.
+# WEIGHT_DTYPE requires tt-inference-server-2's vllm_runner.py to read it
+# from an env var rather than a hardcoded "bfp_bf8" (committed there).
+#
+# NOTE the two knobs use different "disable" sentinels, NOT both "":
+#   - WEIGHT_DTYPE: "" means bf16 (a plain string; empty is explicitly
+#     accepted as "no conversion" at the PJRT compile-option layer).
+#   - KV_CACHE_DTYPE: "none" (NOT "") means bf16. It's an Optional<string>
+#     PJRT-side; "" is a populated-but-unrecognized value, not "unset", and
+#     errors with "Invalid experimental_kv_cache_dtype value: ''".
 #
 # Must run from a tt-xla venv (TT_METAL_HOME/mesh descriptor path resolve
 # from $(pwd), venv/activate needs it too):
@@ -19,7 +32,9 @@ set -eo pipefail  # NOT -u: venv/activate references vars unset until sourced
 
 TT_INFERENCE_SERVER_ROOT=${TT_INFERENCE_SERVER_ROOT:-$HOME/tt-inference-server-2}
 
-export TT_MESH_GRAPH_DESC_PATH="${TT_MESH_GRAPH_DESC_PATH:-$(pwd)/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto}"
+export TT_VISIBLE_DEVICES=0
+export TT_MESH_GRAPH_DESC_PATH="/home/kmabee/tt-xla/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal/tt_metal/fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.textproto"
+
 export MODEL=${MODEL:-Falcon3-7B-Instruct}
 export DEVICE=${DEVICE:-p150}
 export API_KEY=${API_KEY:-your-secret-key}
@@ -30,16 +45,20 @@ export IS_GALAXY=${IS_GALAXY:-False}
 # Falcon3-7B FORGE spec (cnn.yaml). Overridable so we can sweep chunk/b1 knobs.
 export MAX_MODEL_LENGTH=${MAX_MODEL_LENGTH:-32768}
 export MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
-export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.35}
+export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.20}
 export TT_KV_POOL_GB=${TT_KV_POOL_GB:-32}
 export OPTIMIZATION_LEVEL=${OPTIMIZATION_LEVEL:-1}
 export CPU_SAMPLING=${CPU_SAMPLING:-false}
 export ENABLE_TRACE=${ENABLE_TRACE:-true}
-export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-bfp_bf8}
+export WEIGHT_DTYPE=${WEIGHT_DTYPE:-}
+export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-none}
 export PREFILL_CHUNK_SIZE=${PREFILL_CHUNK_SIZE:-1024}
 export MIN_NUM_SEQS=${MIN_NUM_SEQS:-1}
 export PREFILL_BATCH_THRESHOLD=${PREFILL_BATCH_THRESHOLD:-16}
 unset FP32_DEST_ACC_EN
+
+# Hack
+# export NUM_HIDDEN_LAYERS=1
 
 export DEVICE_IDS=${DEVICE_IDS:-'(0)'}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
@@ -50,7 +69,7 @@ DEVICE_IDS_SAFE=$(echo "$DEVICE_IDS" | tr -dc '0-9,')
 LOG_DIR="$HOME/scripts"
 LOG="$LOG_DIR/launch_falcon3_7b_instruct_uvicorn_dev${DEVICE_IDS_SAFE}_p${PORT}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "Starting Falcon3-7B-Instruct server (uvicorn): DEVICE_IDS=$DEVICE_IDS PORT=$PORT ctx=$MAX_MODEL_LENGTH b=$MAX_NUM_SEQS gmu=$GPU_MEMORY_UTILIZATION chunk=$PREFILL_CHUNK_SIZE min_num_seqs=$MIN_NUM_SEQS threshold=$PREFILL_BATCH_THRESHOLD"
+echo "Starting Falcon3-7B-Instruct server (uvicorn): DEVICE_IDS=$DEVICE_IDS PORT=$PORT ctx=$MAX_MODEL_LENGTH b=$MAX_NUM_SEQS gmu=$GPU_MEMORY_UTILIZATION chunk=$PREFILL_CHUNK_SIZE min_num_seqs=$MIN_NUM_SEQS threshold=$PREFILL_BATCH_THRESHOLD weight_dtype='${WEIGHT_DTYPE:-bf16}' kv_cache_dtype='$KV_CACHE_DTYPE'"
 echo "tt-inference-server root=$TT_INFERENCE_SERVER_ROOT"
 echo "log=$LOG"
 
