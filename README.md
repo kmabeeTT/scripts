@@ -494,6 +494,31 @@ $ ./slurm_free.py --reserve bh-glx-110-a09u14
 
 ---
 
+### 🩺 tt_mesh_smoke.py
+**Prove every chip in a mesh is alive and computing — in a couple of seconds**
+
+```bash
+python3 tt_mesh_smoke.py                 # per-chip liveness, every shape that fits (1x1, 8x1, 8x4)
+python3 tt_mesh_smoke.py --shape 8x4     # just the full 32-chip Galaxy mesh
+python3 tt_mesh_smoke.py --list          # which shapes fit on this host
+pytest tt_mesh_smoke.py -v -k 8x4        # same checks, as a parameterized pytest
+
+python3 tt_mesh_smoke.py --interconnect  # fabric ladder: pair -> every row -> every column
+python3 tt_mesh_smoke.py --stage pair    # one interconnect stage
+python3 tt_mesh_smoke.py --all           # liveness for every shape, then the fabric ladder (~45s)
+TT_MESH_SMOKE_INTERCONNECT=1 pytest tt_mesh_smoke.py -v -k interconnect
+```
+
+**Output (liveness)**: per-shape open time and physical chip ids, then a pass/fail line per op with the worst PCC across devices. On healthy Blackhole silicon: `eltwise add: all 32 devices correct (worst pcc 1.00000)` / `matmul: all 32 devices correct (worst pcc 0.99999)`. Runtime 1.7s (1x1), 1.9s (8x1), 2.4s (8x4) — device open dominates; the math is microseconds.
+
+**Output (interconnect)**: `all_gather: all 32 devices received their 4 slabs intact`. Each device is checked for having received exactly the slabs it should have, matched *by content* rather than position, so it proves data physically crossed links rather than just that the op returned. Stages escalate — 2-chip submesh, then every row of the mesh at once (`cluster_axis=1`), then every column (`cluster_axis=0`) — and stop at the first failure rather than escalating onto a broken fabric. ~25s for all three; each stage gets a freshly opened parent mesh.
+
+**Use when**: you want to know whether the board is healthy *before* blaming your model, after a reset, or after a hang. Each device gets its own seeded `N(0,1)` block and is verified independently, so a failure names the chip (`dev17 pcc=0.0021`) instead of just failing the mesh.
+
+**Note**: The default (liveness) mode is deliberately local-only — no CCL, no fabric — so it can't hang on topology. The `--interconnect` ladder does bring fabric up, and two things there are worth knowing: `TT_METAL_OPERATION_TIMEOUT_SECONDS` (set to 30s by the script) bounds *dispatch ops* only, **not** fabric bring-up — a fabric that can't route blocks forever inside `open_mesh_device`, and killing that is what wedges an ethernet core (recovery: `tt-smi -glx_reset`). And `FABRIC_1D` works on a BH Galaxy while `--ring` (`FABRIC_1D_RING`) hangs at bring-up, *even though* the physical grouping descriptor advertises `TORUSX/TORUSY/TORUSXY` matches — descriptor matching a torus does not mean the ring routes. The script auto-sets `TT_MESH_GRAPH_DESC_PATH` to `single_bh_galaxy_mesh_graph_descriptor.textproto` when unset (it must be exported before `import ttnn` to take effect). Needs `TT_METAL_HOME`, `PYTHONPATH`, and the tt-metal venv, same as any ttnn run.
+
+---
+
 ## Model Server Scripts (`model_servers/`)
 
 Launch forge LLM servers via `run.py` and drive evals against them, matching tt-inference-server's CI config exactly. Currently Falcon3-7B-Instruct; more models to follow the same naming pattern (`launch_<model>_docker.sh`, `launch_<model>_uvicorn.sh`).
