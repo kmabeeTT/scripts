@@ -446,6 +446,54 @@ Distinct model names: 13
 
 ---
 
+### 🖥️ slurm_free.py
+**Find free/reserved Tenstorrent hardware machines managed by slurm, and print example reservation commands**
+
+```bash
+./slurm_free.py                          # all machines, grouped by state
+./slurm_free.py -f                       # only free (idle) machines
+./slurm_free.py bh-lb                    # filter machine names by regex
+./slurm_free.py --forge                  # only the forge team's allocated machines
+./slurm_free.py --forge -f               # free forge machines specifically
+./slurm_free.py -q                       # only machines with a pending queue
+./slurm_free.py -f --reserve             # example salloc command for a free match
+./slurm_free.py --reserve bh-glx-b02u02  # example salloc command for a specific machine
+./slurm_free.py -v bh-lb                 # also print the underlying scontrol/squeue commands
+```
+
+**Output**: One line per machine — name, state (`FREE`/`BUSY`/`DRAINING`/`DOWN`), and either who's holding it (user, job name, elapsed time) or the drain/down reason. Machines with a pending (`PD`) job explicitly requesting them are marked `QUEUED: user waiting Xh`. A summary line at top counts machines by state for the current filter.
+
+**Use when**: You want to find an available machine for your team without memorizing `sinfo`/`squeue`/`scontrol` syntax, or want to check whether reserving a specific machine would put you behind someone else already queued for it.
+
+**Args**:
+- `pattern` (optional, positional) — regex matched against machine name.
+- `-f/--free-only`, `-b/--busy-only` — restrict to one state.
+- `-q/--pending-only` — only machines with a queued (`PD`) request against them.
+- `--forge` — restrict to the forge team's currently allocated machines (hardcoded list near the top of the script — update it as allocations change).
+- `-p/--show-partitions` — also print each machine's slurm partition(s).
+- `--reserve [MACHINE]` — print (don't run) an example `salloc` command for `MACHINE`, or the first free match if omitted; warns if anyone is already queued for it.
+- `-v/--show-commands` — print the actual `scontrol`/`squeue` commands as they run, so you can learn the raw slurm commands directly.
+- `--no-color` — disable ANSI colors (auto-disabled when piped).
+
+**Example**:
+```bash
+$ ./slurm_free.py --forge -f
+Machines (9 match (forge team)): BUSY: 9
+
+(no machines matched)
+
+$ ./slurm_free.py --reserve bh-glx-110-a09u14
+...
+  heads up: 1 job(s) already queued for bh-glx-110-a09u14 -- you'd be joining behind:
+    yugao          job=yugao-reserve-a09u14-inf waiting 6d5h  (jobid 30869)
+
+  salloc --partition=bh_sc36_6 --nodelist=bh-glx-110-a09u14 --job-name=kmabee-prefill
+```
+
+**Note**: This cluster's "nodes" are individual Tenstorrent hardware machines, not compute nodes — one machine per slurm node. `salloc` with no trailing command just holds the reservation in that shell; you `ssh` to the machine directly to do the actual work, then exit both to release it.
+
+---
+
 ## Model Server Scripts (`model_servers/`)
 
 Launch forge LLM servers via `run.py` and drive evals against them, matching tt-inference-server's CI config exactly. Currently Falcon3-7B-Instruct; more models to follow the same naming pattern (`launch_<model>_docker.sh`, `launch_<model>_uvicorn.sh`).
