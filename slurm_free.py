@@ -310,7 +310,7 @@ def main():
         print(c("BOLD", f"Example reservation command for {target}") +
               " (this only prints the command, it doesn't run it):\n")
         job_name = f"{os.environ.get('USER', 'me')}-prefill"
-        print(f"  salloc --partition={partition} --nodelist={target} --job-name={job_name}")
+        print(f"  salloc --no-shell -w {target} -p {partition} --job-name={job_name}")
         if node["state"] != "FREE":
             print(f"\n  note: {target} is currently {node['state']}, not free -- salloc will "
                   f"queue (PD) until it's released.")
@@ -321,11 +321,13 @@ def main():
             for j in jobs:
                 print(f"    {j['user']:<14} job={j['jobname']:<20} waiting {j['waiting']:<8} "
                       f"(jobid {j['jobid']})")
-        print("\n  # salloc blocks and holds the reservation in that shell.")
-        print(f"  # In a second terminal (or once salloc returns), connect to the machine:")
+        print("\n  # --no-shell backgrounds the allocation immediately -- it survives an SSH")
+        print("  # disconnect (unlike a bare `salloc` with no flags, which dies with your shell).")
+        print(f"  # Connect to the machine once it's allocated:")
         print(f"  ssh {target}")
-        print("  # When done: exit the ssh session, then Ctrl-D / 'exit' the salloc shell "
-              "to release the machine.")
+        print(f"  # When done, release it explicitly: scancel $(squeue -h -u $USER -w {target} -o %i)")
+        print("  # Also: node assignments rotate by team/time -- your job can be killed if it")
+        print("  # runs outside your team's assigned window (see the shared allocation sheet).")
 
 
 if __name__ == "__main__":

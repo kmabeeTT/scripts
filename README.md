@@ -487,10 +487,10 @@ $ ./slurm_free.py --reserve bh-glx-110-a09u14
   heads up: 1 job(s) already queued for bh-glx-110-a09u14 -- you'd be joining behind:
     yugao          job=yugao-reserve-a09u14-inf waiting 6d5h  (jobid 30869)
 
-  salloc --partition=bh_sc36_6 --nodelist=bh-glx-110-a09u14 --job-name=kmabee-prefill
+  salloc --no-shell -w bh-glx-110-a09u14 -p bh_sc36_6 --job-name=kmabee-prefill
 ```
 
-**Note**: This cluster's "nodes" are individual Tenstorrent hardware machines, not compute nodes — one machine per slurm node. `salloc` with no trailing command just holds the reservation in that shell; you `ssh` to the machine directly to do the actual work, then exit both to release it.
+**Note**: This cluster's "nodes" are individual Tenstorrent hardware machines, not compute nodes — one machine per slurm node. `--no-shell` backgrounds the allocation so it survives an SSH disconnect (a bare `salloc` with no flags dies with your shell/terminal); `ssh` to the machine directly to do the actual work, then `scancel` the job when done. Node assignments also rotate across teams by time/day (see the internal Slurm User Guide) — a job running outside its team's assigned window can be killed regardless of `--no-shell`.
 
 ---
 
