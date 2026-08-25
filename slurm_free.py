@@ -31,7 +31,8 @@ STATE_ORDER = ["FREE", "BUSY", "DRAINING", "DOWN", "OTHER"]
 FORGE_MACHINES = {
     "bh-glx-b02u02", "bh-glx-b02u08",
     "bh-glx-b03u02", "bh-glx-b03u08",
-    "bh-glx-110-a10u02", "bh-glx-110-a10u08", "bh-glx-110-a10u14", "bh-glx-110-a10u20",
+    # 110-A-Quad3 (14kW) - replaces 110-A-Quad9 per BojanM, 2026-08-25
+    "bh-glx-110-a04u02", "bh-glx-110-a04u08", "bh-glx-110-a05u02", "bh-glx-110-a05u08",
     "bh-glx-120-c01u02",
 }
 
