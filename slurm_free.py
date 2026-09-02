@@ -29,8 +29,10 @@ STATE_ORDER = ["FREE", "BUSY", "DRAINING", "DOWN", "OTHER"]
 # Machines currently allocated to the forge team. Update this list as
 # allocations change.
 FORGE_MACHINES = {
-    "bh-glx-b02u02", "bh-glx-b02u08",
-    "bh-glx-b03u02", "bh-glx-b03u08",
+    # renamed from bh-glx-b0Xu0Y during the 2026-09-02 maintenance window
+    # (hostname glitch fix, Rev A quad)
+    "bh-glx-120-b02u02", "bh-glx-120-b02u08",
+    "bh-glx-120-b03u02", "bh-glx-120-b03u08",
     # 110-A-Quad3 (14kW) - replaces 110-A-Quad9 per BojanM, 2026-08-25
     "bh-glx-110-a04u02", "bh-glx-110-a04u08", "bh-glx-110-a05u02", "bh-glx-110-a05u08",
     "bh-glx-120-c01u02",
