@@ -517,6 +517,58 @@ TT_MESH_SMOKE_INTERCONNECT=1 pytest tt_mesh_smoke.py -v -k interconnect
 
 **Note**: The default (liveness) mode is deliberately local-only — no CCL, no fabric — so it can't hang on topology. The `--interconnect` ladder does bring fabric up, and two things there are worth knowing: `TT_METAL_OPERATION_TIMEOUT_SECONDS` (set to 30s by the script) bounds *dispatch ops* only, **not** fabric bring-up — a fabric that can't route blocks forever inside `open_mesh_device`, and killing that is what wedges an ethernet core (recovery: `tt-smi -glx_reset`). And `FABRIC_1D` works on a BH Galaxy while `--ring` (`FABRIC_1D_RING`) hangs at bring-up, *even though* the physical grouping descriptor advertises `TORUSX/TORUSY/TORUSXY` matches — descriptor matching a torus does not mean the ring routes. The script auto-sets `TT_MESH_GRAPH_DESC_PATH` to `single_bh_galaxy_mesh_graph_descriptor.textproto` when unset (it must be exported before `import ttnn` to take effect). Needs `TT_METAL_HOME`, `PYTHONPATH`, and the tt-metal venv, same as any ttnn run.
 
+### 👀 pr_review_status.py
+**Which reviews is a PR actually still waiting on, and who can clear them**
+
+```bash
+python3 pr_review_status.py https://github.com/tenstorrent/tt-metal/pull/55279
+python3 pr_review_status.py 55279 --repo tenstorrent/tt-metal      # bare number + repo
+python3 pr_review_status.py 8777                                   # from inside a checkout
+
+python3 pr_review_status.py 55279 --repo tenstorrent/tt-metal --markdown   # table to paste in Slack
+python3 pr_review_status.py 55279 --repo tenstorrent/tt-metal --json       # machine-readable
+python3 pr_review_status.py 55279 --repo tenstorrent/tt-metal --no-history # fast, skips ranking
+
+# No PR at all — just "who signs off for this team?"
+python3 pr_review_status.py --repo tenstorrent/tt-metal --teams metalium-developers-infra
+```
+
+**Output**: the branch's review rules, the approvals so far, then one row per **ownership
+group** — changed files that share an identical CODEOWNERS owner set — marked `OK` /
+`PENDING` / `CHANGES REQ`, with the people who usually approve for each. Ends with the
+minimum number of additional approvals and who to ping.
+
+**Use when**: GitHub says "Review required" but not *whose*. With
+`require_code_owner_review` the headline "1 approval required" is misleading — the real
+requirement is ≥N approvals **and** every owned path approved by one of its owners, so
+the number of people you need is however many it takes to cover the pending groups.
+
+**How it works**: four things GitHub never shows together —
+1. every `pull_request` rule applying to the base branch, unioned (GitHub enforces the
+   strictest, and a repo commonly has more than one ruleset — tt-metal `main` has two),
+2. CODEOWNERS resolved against the changed files with GitHub's own pattern semantics
+   (gitignore-like, last match wins, but a wildcard in the final segment does not recurse:
+   `docs/*` owns `docs/a.md`, not `docs/sub/b.md`),
+3. submitted reviews expanded through team membership, to mark each group satisfied,
+4. approvals on recent merged PRs, to rank who signs off for each pending group.
+
+The "minimum N more people" line is a real minimum set cover, not a greedy guess — that
+is what tells you whether two pending groups collapse onto one reviewer or genuinely
+cannot. It also knows a `CHANGES_REQUESTED` review is only cleared by that same reviewer,
+that the PR author cannot self-approve, and that GitHub leaves individual review requests
+standing long after a co-owner has satisfied the same path (the usual source of "why are
+four people still listed?").
+
+**Requires**: `gh` authenticated with `read:org` (for team membership). Add `--files` to
+list every file in a group, `--all-groups` to include satisfied ones, `--scan N` to look
+further back for a low-traffic team's approvers.
+
+**Related**: the `pr-review-approvers` Claude Code skill covers the same ground
+interactively; this script is the standalone equivalent for anyone not using Claude Code,
+or for piping into other tooling.
+
+---
+
 ---
 
 ## Model Server Scripts (`model_servers/`)
