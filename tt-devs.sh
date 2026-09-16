@@ -184,7 +184,15 @@ uniq_pids() { tr ' ' '\n' <<<"$1" | grep -E '^[0-9]+$' | sort -un; }
 comm_of()   { [ "$BLIND" -eq 1 ] && return; ps -o comm= -p "$1" 2>/dev/null | head -1; }
 user_of()   { [ "$BLIND" -eq 1 ] && return; ps -o user= -p "$1" 2>/dev/null | head -1; }
 pgid_of()   { [ "$BLIND" -eq 1 ] && return; ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
-cmd_of()    { [ "$BLIND" -eq 1 ] && return; tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | sed 's/  *$//'; }
+# A `<` redirect that fails is reported by the SHELL, before the command runs, so a
+# trailing 2>/dev/null does not suppress it -- redirections are processed left to right.
+# Under hidepid another user's /proc/<pid>/cmdline simply does not exist, so the path has
+# to be tested before it is opened or the error leaks to the terminal.
+cmd_of() {
+  [ "$BLIND" -eq 1 ] && return
+  [ -r "/proc/$1/cmdline" ] || return
+  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | sed 's/  *$//'
+}
 
 # Liveness of a PID we may not be able to see. LC_ALL=C keeps the errno strings
 # stable so the EPERM/ESRCH distinction stays parseable.
