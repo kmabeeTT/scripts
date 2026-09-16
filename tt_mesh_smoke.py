@@ -48,12 +48,14 @@ Needs TT_METAL_HOME + PYTHONPATH set and the tt-metal venv active, same as any t
 Exit code is 0 only if every chip in every requested shape passed.
 """
 
+# Annotations are not evaluated at def time, which is what lets `torch.Tensor` appear in a
+# signature while torch itself is imported lazily (see _load_runtime).
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 import time
-
-import torch
 
 # Bound every device-side op *before* ttnn opens anything. This is the single most
 # important line in the interconnect path: a stalled fabric op then raises a normal
@@ -110,7 +112,33 @@ else:
             f"  descriptor itself on a 32-chip Galaxy."
         )
 
-import ttnn
+# torch and ttnn are imported on demand, not here. Between them they cost ~30s on this box
+# (they sit on NFS), and nothing at module scope needs either — so --help, a mistyped flag
+# and the usage error path all answer instantly instead of paying for a runtime they never
+# use. The env setup above still happens at import time, which is what
+# TT_MESH_GRAPH_DESC_PATH requires: the control plane reads it when the cluster is built.
+torch = None
+ttnn = None
+
+
+def _load_runtime():
+    """Import torch and ttnn once, publishing them as the module globals the file uses.
+
+    Both live on NFS here and cost ~27s (torch) and a few more (ttnn) to import, against
+    0.4s of interpreter startup — so paying for them only when there is real work to do is
+    the difference between --help answering instantly and taking half a minute.
+
+    Idempotent, and called from every entry point that touches hardware, so the pytest
+    path (which never runs main()) is covered too.
+    """
+    global torch, ttnn
+    if torch is None:
+        import torch as _torch
+        torch = _torch
+    if ttnn is None:
+        import ttnn as _ttnn
+        ttnn = _ttnn
+    return ttnn
 
 # (rows, cols). 1x1 = single chip; 8x1 = one column of a Galaxy; 8x4 = whole 32-chip mesh.
 SHAPES = {"1x1": (1, 1), "8x1": (8, 1), "8x4": (8, 4)}
@@ -229,6 +257,7 @@ def hold_open(label, ids, seconds):
 
 def run_shape(rows, cols, verbose=True, hold=0):
     """Open the mesh, run both ops, verify every device. Returns True if all chips passed."""
+    _load_runtime()
     num_devices = rows * cols
     label = f"{rows}x{cols}"
     t0 = time.time()
@@ -282,6 +311,7 @@ def run_shape(rows, cols, verbose=True, hold=0):
 
 
 def shapes_that_fit():
+    _load_runtime()
     avail = ttnn.get_num_devices()
     return {k: v for k, v in SHAPES.items() if v[0] * v[1] <= avail}
 
@@ -422,6 +452,7 @@ def run_stage(parent, stage, verbose=True):
 
 def run_interconnect(selected=None, ring=False, verbose=True):
     """Open the full mesh with fabric once, then run the ladder, stopping at first failure."""
+    _load_runtime()
     avail = ttnn.get_num_devices()
     fabric = ttnn.FabricConfig.FABRIC_1D_RING if ring else ttnn.FabricConfig.FABRIC_1D
 
@@ -503,6 +534,7 @@ def test_interconnect(stage_name):
         pytest.skip("interconnect stages are opt-in: set TT_MESH_SMOKE_INTERCONNECT=1")
 
     stage = next(s for s in STAGES if s["name"] == stage_name)
+    _load_runtime()
     avail = ttnn.get_num_devices()
     need = (stage["sub"][0] * stage["sub"][1]) if stage["sub"] else avail
     if need > avail:
@@ -517,6 +549,7 @@ def test_mesh_alive(mesh_shape_name):
     import pytest
 
     rows, cols = SHAPES[mesh_shape_name]
+    _load_runtime()
     avail = ttnn.get_num_devices()
     if rows * cols > avail:
         pytest.skip(f"mesh {mesh_shape_name} needs {rows * cols} devices, host has {avail}")
@@ -552,6 +585,11 @@ def main():
 
     if args.op_timeout:
         os.environ["TT_METAL_OPERATION_TIMEOUT_SECONDS"] = str(args.op_timeout)
+
+    # Everything above is argv-only and costs nothing; the runtime loads from here on.
+    # Loading after the parse also means --op-timeout is in the environment before the
+    # control plane reads it, which was not true when ttnn was imported at module scope.
+    _load_runtime()
 
     avail = ttnn.get_num_devices()
     fits = shapes_that_fit()
