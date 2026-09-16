@@ -34,6 +34,10 @@ Usage (standalone):
     python3 ~/scripts/tt_mesh_smoke.py --interconnect # fabric ladder instead of liveness
     python3 ~/scripts/tt_mesh_smoke.py --stage pair   # one interconnect stage
     python3 ~/scripts/tt_mesh_smoke.py --all          # liveness, then the fabric ladder
+    python3 ~/scripts/tt_mesh_smoke.py --shape 8x4 --hold 60
+                                                      # hold the chips claimed for 60s, so
+                                                      # another user can test whether their
+                                                      # tooling sees the claim (hidepid=2)
 
 Usage (pytest):
     pytest ~/scripts/tt_mesh_smoke.py -v
@@ -183,7 +187,47 @@ def check_per_device(got, ref, num_devices, op_name, threshold):
     return bad
 
 
-def run_shape(rows, cols, verbose=True):
+def hold_open(label, ids, seconds):
+    """Keep an already-open mesh idle for `seconds` so another user can observe the claim.
+
+    Exists for cross-user device-visibility testing. Since /proc is mounted hidepid=2 these
+    boxes hide other users' processes, so the only cross-user evidence that a chip is taken
+    is UMD's CHIP_IN_USE robust mutex in /dev/shm, which is held for exactly as long as the
+    mesh is open (LocalChip::start_device -> close_device). A normal smoke run holds the
+    chips for a few seconds, which is not long enough for someone else to look; this widens
+    that window on purpose.
+
+    The mesh is deliberately left idle rather than kept computing: the claim is what is
+    being tested, and holding the lock does not require doing work. Note that tt_aiclk does
+    NOT fall back to its 800MHz idle value during the hold - UMD raises it to ~1350 at
+    bring-up and it stays there until the device is closed - so the clock tracks "open"
+    rather than "busy", and an observer sees both signals agree for the whole window.
+
+    Ctrl-C during the hold returns normally so run_shape's `finally` still closes the mesh —
+    releasing the mutex cleanly rather than leaving a stale lock behind for the next job.
+    """
+    end = time.time() + seconds
+    chips = ",".join(str(i) for i in ids) if ids else "?"
+    print(f"  mesh {label}: HOLDING {len(ids)} chips open for {seconds}s "
+          f"(pid {os.getpid()}, until {time.strftime('%H:%M:%S', time.localtime(end))})",
+          flush=True)
+    print(f"    chips held: {chips}", flush=True)
+    print(f"    devices stay claimed until this exits; Ctrl-C releases them early",
+          flush=True)
+    try:
+        while True:
+            left = end - time.time()
+            if left <= 0:
+                break
+            time.sleep(min(10, left))
+            left = max(0.0, end - time.time())
+            print(f"    holding... {left:.0f}s left", flush=True)
+        print(f"  mesh {label}: hold complete, releasing devices", flush=True)
+    except KeyboardInterrupt:
+        print(f"\n  mesh {label}: hold interrupted, releasing devices", flush=True)
+
+
+def run_shape(rows, cols, verbose=True, hold=0):
     """Open the mesh, run both ops, verify every device. Returns True if all chips passed."""
     num_devices = rows * cols
     label = f"{rows}x{cols}"
@@ -223,6 +267,11 @@ def run_shape(rows, cols, verbose=True):
 
         bad = check_per_device(out_add, ref_add, num_devices, "eltwise add", PCC_ADD)
         bad += check_per_device(out_mm, ref_mm, num_devices, "matmul    ", PCC_MATMUL)
+
+        # Held inside the try, so the mesh (and every chip's CHIP_IN_USE lock) is still
+        # open for the whole window, and the finally below always releases it.
+        if hold > 0:
+            hold_open(label, ids, hold)
     finally:
         ttnn.close_mesh_device(mesh)
 
@@ -491,6 +540,11 @@ def main():
     ap.add_argument("--ring", action="store_true",
                     help="use FABRIC_1D_RING instead of FABRIC_1D; needs ring/torus cabling and "
                          "hangs without it — opt in only if you know the box is cabled for it")
+    ap.add_argument("--hold", type=int, default=0, metavar="SEC",
+                    help="after the checks pass, keep the mesh open and idle for SEC seconds "
+                         "before releasing it. For cross-user visibility testing: it widens "
+                         "the window in which another user can see this job's CHIP_IN_USE "
+                         "locks (see tt-devs.sh). Ctrl-C releases the devices cleanly.")
     ap.add_argument("--op-timeout", type=int, metavar="SEC",
                     help="per-op dispatch timeout in seconds (default 30); a stalled fabric op "
                          "then raises instead of wedging the board")
@@ -523,7 +577,7 @@ def main():
                 results[name] = None
                 continue
             try:
-                results[name] = run_shape(rows, cols)
+                results[name] = run_shape(rows, cols, hold=args.hold)
             except Exception as exc:  # a failed open is a result, not a crash
                 print(f"  mesh {name}: ERROR — {type(exc).__name__}: {exc}\n")
                 results[name] = False
