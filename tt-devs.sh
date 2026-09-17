@@ -44,6 +44,23 @@
 #          because it cannot name a holder, but it is a claim-grade signal and
 #          it is what contradicts a dead-looking owner pid below.
 #
+# WHO, AND FOR HOW LONG
+#   user   ps cannot name another user's process, but cgroup v2 can: cgroup.procs is
+#          world-readable and not filtered by hidepid, and the owning uid is in the path
+#          (user-<uid>.slice). So a hidden holder still gets a real username.
+#   held   "~12m03s" is exact but is PROCESS age, so it slightly overstates the hold (a
+#          job imports for a few seconds before opening a device). ">=4m12s" is a lower
+#          bound from this tool's own first-seen cache
+#          (${XDG_CACHE_HOME:-~/.cache}/tt-devs/first-seen), which is all a hidden holder
+#          allows -- there is no cross-user process start time. Candidates tried and
+#          rejected: the CHIP_IN_USE file's mtime is its creation date (stayed two days
+#          stale while a job ran), tt_device_<asic>_memory tracks last allocation and
+#          covered only 21 of 32 held chips, the login session scope is hours older than
+#          the job, and the device node's atime is boot.
+#   lock   the CHIP_IN_USE path is printed under each umd-sourced holder. The basename is
+#          the same mutex name UMD puts in its own contention warning, so a "Waiting for
+#          lock 'CHIP_IN_USE_0_PCIe'" line in a job log matches a line here.
+#
 # HIDDEN vs STALE HOLDERS
 #   For a PID we cannot see, `kill -0` still distinguishes the two cases that
 #   matter, because signal permission checks are not subject to hidepid:
@@ -138,7 +155,7 @@ if [ ${#DEVICES[@]} -eq 0 ]; then
 fi
 
 # ---- source: UMD CHIP_IN_USE robust mutexes (cross-user) -------------------
-declare -A UMD_PID UMD_TID UMD_CREATOR
+declare -A UMD_PID UMD_TID UMD_CREATOR UMD_FILE
 for f in "$SHM_DIR"/TT_UMD_LOCK.CHIP_IN_USE_*; do
   idx=${f##*CHIP_IN_USE_}; idx=${idx%%_*}
   [[ $idx =~ ^[0-9]+$ ]] || continue
@@ -148,6 +165,7 @@ for f in "$SHM_DIR"/TT_UMD_LOCK.CHIP_IN_USE_*; do
   [ -n "$pid" ] && [ "$pid" != 0 ] || continue
   UMD_PID["/dev/tenstorrent/$idx"]=$pid
   UMD_TID["/dev/tenstorrent/$idx"]=$tid
+  UMD_FILE["/dev/tenstorrent/$idx"]=$f
   UMD_CREATOR["/dev/tenstorrent/$idx"]=$(stat -c %U "$f" 2>/dev/null)
 done
 
@@ -192,6 +210,95 @@ cmd_of() {
   [ "$BLIND" -eq 1 ] && return
   [ -r "/proc/$1/cmdline" ] || return
   tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | sed 's/  *$//'
+}
+
+# Seconds -> compact human duration (45s / 12m03s / 1h04m).
+fmt_dur() {
+  local t=$1
+  [ -n "$t" ] && [ "$t" -ge 0 ] 2>/dev/null || return
+  if   [ "$t" -lt 60 ];   then printf '%ds' "$t"
+  elif [ "$t" -lt 3600 ]; then printf '%dm%02ds' $((t/60)) $((t%60))
+  else                         printf '%dh%02dm' $((t/3600)) $(((t%3600)/60))
+  fi
+}
+
+# pid -> username, even for a PID hidepid hides from us.
+#
+# cgroup v2 is not subject to hidepid: /sys/fs/cgroup/.../cgroup.procs is root-owned but
+# world-readable, and a login session's scope sits under user-<uid>.slice, so the uid
+# falls out of the path. Verified against a live foreign job -- its hidden holder PID was
+# found under user-4259.slice and resolved to the right account, and left the map when
+# the job exited. Processes live in leaf scopes (session-N.scope), never the top slice,
+# so the tree has to be walked; that is ~7ms, done once per run. Scoped to user.slice
+# deliberately: a login session's scope can only live there, and a containerized job would
+# sit under system.slice/kubepods where no uid appears in the path -- it would not resolve
+# anyway, which matches the container blind spot noted above.
+CG_MAP=
+cg_user_of() {
+  local pid=$1 uid
+  if [ -z "$CG_MAP" ]; then
+    CG_MAP=$(awk '
+      FNR==1 { uid=""; if (match(FILENAME, /user-[0-9]+\.slice/)) {
+                 s=substr(FILENAME, RSTART+5); sub(/\.slice.*/,"",s); uid=s } }
+      uid!="" && /^[0-9]+$/ { print $1" "uid }
+    ' $(find /sys/fs/cgroup/user.slice -name cgroup.procs 2>/dev/null) 2>/dev/null)
+    CG_MAP=${CG_MAP:-none}
+  fi
+  [ "$CG_MAP" = none ] && return
+  uid=$(awk -v p="$pid" '$1==p{print $2; exit}' <<<"$CG_MAP")
+  [ -n "$uid" ] || return
+  getent passwd "$uid" 2>/dev/null | cut -d: -f1
+}
+
+# Elapsed seconds since a VISIBLE pid started. Empty for a hidden one: there is no
+# cross-user start time on this box. Every other candidate was measured and rejected --
+# the CHIP_IN_USE file's own mtime is its creation date and stayed two days stale while a
+# job ran; tt_device_<asic>_memory tracks last allocation and covered only 21 of 32 held
+# chips; the login session scope was hours older than the job; the device node's atime is
+# boot. Note this is PROCESS age, so it is an upper bound on the hold: a job spends some
+# seconds importing before it opens a device. Shown with a leading ~ for that reason.
+pid_age_secs() {
+  [ "$BLIND" -eq 1 ] && return
+  ps -o etimes= -p "$1" 2>/dev/null | tr -d ' '
+}
+
+# First-seen cache: the only duration available for a hidden holder. Records when this
+# tool first saw a pid holding a chip, so a later run can report a lower bound. Dead pids
+# are pruned each run, which also bounds how badly pid reuse can mislead. Reported with a
+# leading >= since the hold began at or before the first sighting.
+SEEN_FILE=${XDG_CACHE_HOME:-$HOME/.cache}/tt-devs/first-seen
+SEEN_DATA=
+SEEN_DIRTY=0
+seen_load() { [ -r "$SEEN_FILE" ] && SEEN_DATA=$(cat "$SEEN_FILE" 2>/dev/null); return 0; }
+# Sets SEEN_FIRST. Deliberately NOT a value-returning function: it mutates SEEN_DATA and
+# SEEN_DIRTY, and `x=$(seen_first ...)` would run it in a subshell and silently discard
+# both, so the cache would never be written and every run would report >=0s.
+seen_first() {
+  local pid=$1 e
+  e=$(awk -v p="$pid" '$1==p{print $2; exit}' <<<"$SEEN_DATA")
+  if [ -z "$e" ]; then
+    e=$(date +%s)
+    SEEN_DATA="${SEEN_DATA:+$SEEN_DATA
+}$pid $e"
+    SEEN_DIRTY=1
+  fi
+  SEEN_FIRST=$e
+}
+seen_save() {
+  [ "$SEEN_DIRTY" -eq 1 ] || return 0
+  mkdir -p "${SEEN_FILE%/*}" 2>/dev/null || return 0
+  local out= line pid
+  while read -r line; do
+    [ -n "$line" ] || continue
+    pid=${line%% *}
+    [ "$(pid_state "$pid")" = dead ] && continue
+    out="${out:+$out
+}$line"
+  done <<<"$SEEN_DATA"
+  printf '%s\n' "$out" > "$SEEN_FILE.tmp$$" 2>/dev/null \
+    && mv -f "$SEEN_FILE.tmp$$" "$SEEN_FILE" 2>/dev/null
+  rm -f "$SEEN_FILE.tmp$$" 2>/dev/null
+  return 0
 }
 
 # Liveness of a PID we may not be able to see. LC_ALL=C keeps the errno strings
@@ -252,18 +359,45 @@ serving_lines() {
 
 # One holder line (+ cmd line when we can see it).
 print_holder() {
-  local pid=$1 src=$2 state comm usr cmd
+  local pid=$1 src=$2 lock=${3:-} state comm usr cmd age held now first
   state=$(pid_state "$pid")
   comm=$(comm_of "$pid"); usr=$(user_of "$pid")
   if [ -z "$usr" ]; then
+    # ps cannot see it, but cgroup v2 still names the owner.
+    usr=$(cg_user_of "$pid")
+    if [ -n "$usr" ]; then
+      usr="$usr ${DIM}(hidden)${RST}"
+    else
+      case "$state" in
+        hidden) usr="? ${DIM}(hidden)${RST}" ;;
+        dead)   usr="-" ;;
+        *)      usr="?" ;;
+      esac
+    fi
     case "$state" in
-      hidden) usr="? ${DIM}(hidden)${RST}"; comm=${comm:-"? (hidden)"} ;;
-      dead)   usr="-";                      comm=${comm:-"(exited - stale lock)"} ;;
-      *)      usr="?";                      comm=${comm:-"?"} ;;
+      hidden) comm=${comm:-"? (hidden)"} ;;
+      dead)   comm=${comm:-"(exited - stale lock)"} ;;
+      *)      comm=${comm:-"?"} ;;
     esac
   fi
-  printf '    %sPID %-8s%s %s%-18s%s user=%s %s[%s]%s\n' \
+
+  # How long it has been held. ~ = process age (upper bound, exact but includes startup);
+  # >= = since this tool first saw the pid, which is all a hidden holder allows.
+  held=
+  age=$(pid_age_secs "$pid")
+  if [ -n "$age" ]; then
+    held="~$(fmt_dur "$age")"
+  elif [ "$state" != dead ]; then
+    now=$(date +%s); seen_first "$pid"; first=$SEEN_FIRST
+    [ -n "$first" ] && held=">=$(fmt_dur $((now - first)))"
+  fi
+
+  printf '    %sPID %-8s%s %s%-18s%s user=%s %s[%s]%s' \
     "$BOLD" "$pid" "$RST" "$CYN" "$comm" "$RST" "$usr" "$DIM" "$src" "$RST"
+  [ -n "$held" ] && printf ' %sheld %s%s' "$YEL" "$held" "$RST"
+  printf '\n'
+
+  [ -n "$lock" ] && printf '        %slock:%s %s\n' "$DIM" "$RST" "$lock"
   cmd=$(cmd_of "$pid")
   if [ -n "$cmd" ]; then
     [ ${#cmd} -gt 96 ] && cmd="${cmd:0:96}..."
@@ -287,12 +421,15 @@ if [ "$RESTRICTED" -eq 1 ]; then
   [ "$BLIND" -eq 1 ] && why="--blind"
   printf '%s! restricted /proc (%s): ps/fuser see only your own processes.%s\n' \
     "$YEL" "$why" "$RST"
-  printf '%s  Cross-user holders come from UMD CHIP_IN_USE locks; other users%s\n' "$DIM" "$RST"
-  printf '%s  appear as user=? (hidden) with no command line.%s\n' "$DIM" "$RST"
+  printf '%s  Cross-user holders come from UMD CHIP_IN_USE locks, named via cgroup;%s\n' "$DIM" "$RST"
+  printf '%s  another user shows as "user=NAME (hidden)" with no command line, and a%s\n' "$DIM" "$RST"
+  printf '%s  held time of >=N (lower bound) rather than an exact process age.%s\n' "$DIM" "$RST"
 else
   printf '%s  full /proc visibility: all processes are visible.%s\n' "$DIM" "$RST"
 fi
 printf '%s%s%s\n' "$DIM" "------------------------------------------------------------" "$RST"
+
+seen_load
 
 for dev in "${DEVICES[@]}"; do
   upid=${UMD_PID[$dev]:-}
@@ -336,11 +473,11 @@ for dev in "${DEVICES[@]}"; do
   printf '%-22s %sIN USE%s%s\n' "$dev" "$RED" "$RST" "$note"
 
   if [ -n "$upid" ]; then
-    print_holder "$upid" "umd CHIP_IN_USE"
-    if [ "$ustate" = hidden ]; then
+    print_holder "$upid" "umd CHIP_IN_USE" "${UMD_FILE[$dev]:-}"
+    if [ "$ustate" = hidden ] && [ -z "$(cg_user_of "$upid")" ]; then
       creator=${UMD_CREATOR[$dev]:-}
-      # The shm file's owner is whoever first created the lock, not necessarily
-      # the current holder - a weak hint for who to ask, nothing more.
+      # Fallback only: the shm file's owner is whoever first created the lock, not
+      # necessarily the current holder. Skipped entirely when cgroup named the real one.
       if [ -n "$creator" ] && [ "$creator" != "$(id -un)" ]; then
         printf '        %shint:%s lock file created by %s %s(may be a previous job)%s\n' \
           "$DIM" "$RST" "$creator" "$DIM" "$RST"
@@ -368,6 +505,8 @@ for dev in "${DEVICES[@]}"; do
     fi
   done <<<"$pids"
 done
+
+seen_save
 
 if [ "$RESTRICTED" -eq 1 ] && [ "$claimed" -eq 0 ] && [ "$opened" -eq 0 ]; then
   printf '%s%s%s\n' "$DIM" "------------------------------------------------------------" "$RST"
