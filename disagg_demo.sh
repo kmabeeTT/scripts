@@ -101,8 +101,14 @@ def stream(fh, first_token_banner=None):
             continue
         k = ev.get("ev")
         if k == "handoff" and first_token_banner:
-            note(f"\n  handed off: {ev['seeded']} layers x {ev['positions']} positions "
-                 f"seeded into the ring -- decode owns it from here\n", "g")
+            # seeded_total is the whole model; seeded_here is just the reporting rank's share
+            # (m0 owns 6 of 36). Older event streams only carried the per-rank number, which
+            # read as "only 6 layers were seeded".
+            tot = ev.get("seeded_total", ev.get("seeded"))
+            here, ranks = ev.get("seeded_here"), ev.get("ranks")
+            share = f" ({here} on this rank x {ranks} ranks)" if here and ranks else ""
+            note(f"\n  handed off: {tot} layers x {ev['positions']} positions seeded into the "
+                 f"ring{share} -- decode owns it from here\n", "g")
         elif k == "tok":
             if not printed:
                 print(f"{C['b']}Response:{C['off']} ", end="", flush=True)
