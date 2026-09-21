@@ -469,7 +469,7 @@ Distinct model names: 13
 - `pattern` (optional, positional) — regex matched against machine name.
 - `-f/--free-only`, `-b/--busy-only` — restrict to one state.
 - `-q/--pending-only` — only machines with a queued (`PD`) request against them.
-- `--forge` — restrict to the forge team's currently allocated machines (hardcoded list near the top of the script — update it as allocations change).
+- `--forge` — restrict to the forge team's currently allocated machines (hardcoded list near the top of the script — update it, and the `FORGE_NOTES` power/window annotations next to it, as allocations change). Each machine's line is suffixed with its note, e.g. `(8kW, 2AM-12PM ET)` or `(14kW, 24h)`, when one is defined.
 - `-p/--show-partitions` — also print each machine's slurm partition(s).
 - `--reserve [MACHINE]` — print (don't run) an example `salloc` command for `MACHINE`, or the first free match if omitted; warns if anyone is already queued for it.
 - `-v/--show-commands` — print the actual `scontrol`/`squeue` commands as they run, so you can learn the raw slurm commands directly.
@@ -478,9 +478,9 @@ Distinct model names: 13
 **Example**:
 ```bash
 $ ./slurm_free.py --forge -f
-Machines (9 match (forge team)): BUSY: 9
+Machines (20 match (forge team)): FREE: 1 | BUSY: 19
 
-(no machines matched)
+bh-glx-120-c03u08   FREE       (14kW, 24h)
 
 $ ./slurm_free.py --reserve bh-glx-110-a09u14
 ...

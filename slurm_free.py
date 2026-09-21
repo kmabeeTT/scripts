@@ -26,16 +26,32 @@ from datetime import datetime
 
 STATE_ORDER = ["FREE", "BUSY", "DRAINING", "DOWN", "OTHER"]
 
-# Machines currently allocated to the forge team. Update this list as
-# allocations change.
+# Machines currently allocated to the forge team, as of 2026-09-21.
+# Update this set (and FORGE_NOTES below) as allocations change.
 FORGE_MACHINES = {
-    # renamed from bh-glx-b0Xu0Y during the 2026-09-02 maintenance window
-    # (hostname glitch fix, Rev A quad)
-    "bh-glx-120-b02u02", "bh-glx-120-b02u08",
-    "bh-glx-120-b03u02", "bh-glx-120-b03u08",
-    # 110-A-Quad3 (14kW) - replaces 110-A-Quad9 per BojanM, 2026-08-25
-    "bh-glx-110-a04u02", "bh-glx-110-a04u08", "bh-glx-110-a05u02", "bh-glx-110-a05u08",
-    "bh-glx-120-c01u02",
+    # 120-C-Quad1 (8kW, 2AM-12PM ET window only)
+    "bh-glx-120-c01u02", "bh-glx-120-c01u08", "bh-glx-120-c01u14", "bh-glx-120-c01u20",
+    # 120-C-Quad6 (8kW, 2AM-12PM ET window only)
+    "bh-glx-120-c07u02", "bh-glx-120-c07u08", "bh-glx-120-c07u14", "bh-glx-120-c07u20",
+    # 120-C-Quad7 (8kW, 2AM-12PM ET window only)
+    "bh-glx-120-c08u02", "bh-glx-120-c08u08", "bh-glx-120-c08u14", "bh-glx-120-c08u20",
+    # 120-C-Quad8 (8kW, 2AM-12PM ET window only)
+    "bh-glx-120-c09u02", "bh-glx-120-c09u08", "bh-glx-120-c09u14", "bh-glx-120-c09u20",
+    # 120-C-Quad2 (14kW, 24 hours)
+    "bh-glx-120-c02u02", "bh-glx-120-c02u08", "bh-glx-120-c03u02", "bh-glx-120-c03u08",
+}
+
+# Per-machine annotation shown in --forge output: (power, availability window).
+FORGE_NOTES = {
+    **{n: "8kW, 2AM-12PM ET" for n in (
+        "bh-glx-120-c01u02", "bh-glx-120-c01u08", "bh-glx-120-c01u14", "bh-glx-120-c01u20",
+        "bh-glx-120-c07u02", "bh-glx-120-c07u08", "bh-glx-120-c07u14", "bh-glx-120-c07u20",
+        "bh-glx-120-c08u02", "bh-glx-120-c08u08", "bh-glx-120-c08u14", "bh-glx-120-c08u20",
+        "bh-glx-120-c09u02", "bh-glx-120-c09u08", "bh-glx-120-c09u14", "bh-glx-120-c09u20",
+    )},
+    **{n: "14kW, 24h" for n in (
+        "bh-glx-120-c02u02", "bh-glx-120-c02u08", "bh-glx-120-c03u02", "bh-glx-120-c03u08",
+    )},
 }
 
 COLOR = {
@@ -291,6 +307,8 @@ def main():
                 first = jobs[0]
                 extra = f" (+{len(jobs) - 1} more)" if len(jobs) > 1 else ""
                 line += c("QUEUED", f"  QUEUED: {first['user']} waiting {first['waiting']}{extra}")
+            if args.forge and n["name"] in FORGE_NOTES:
+                line += f"  ({FORGE_NOTES[n['name']]})"
             print(line)
 
     if args.reserve is not None:
