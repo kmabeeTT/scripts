@@ -390,7 +390,7 @@ def main():
         print(c("BOLD", f"Example reservation command for {target}") +
               " (this only prints the command, it doesn't run it):\n")
         job_name = f"{os.environ.get('USER', 'me')}-prefill"
-        print(f"  salloc --no-shell -w {target} -p {partition} --job-name={job_name}")
+        print(f"  salloc --no-shell -w {target} -p {partition} --time=24:00:00 --job-name={job_name}")
         if node["state"] != "FREE":
             print(f"\n  note: {target} is currently {node['state']}, not free -- salloc will "
                   f"queue (PD) until it's released.")
