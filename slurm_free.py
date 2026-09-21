@@ -26,6 +26,12 @@ from datetime import datetime
 
 STATE_ORDER = ["FREE", "BUSY", "DRAINING", "DOWN", "OTHER"]
 
+JOBNAME_MAX = 22  # truncate long job names so one job doesn't blow out the column
+
+
+def truncate(s, n):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
 # Machines currently allocated to the forge team, as of 2026-09-21.
 # Update this set (and FORGE_NOTES below) as allocations change.
 FORGE_MACHINES = {
@@ -124,13 +130,14 @@ def parse_nodes():
 
 
 def parse_jobs():
-    """Map node name -> (user, jobname, elapsed, jobid) for running jobs."""
-    text = run(["squeue", "-h", "-a", "-o", "%i|%j|%u|%t|%M|%N", "--states=R"])
+    """Map node name -> dict(user, jobname, elapsed, jobid, time_limit, time_left) for running jobs.
+    time_limit/time_left are Slurm-formatted strings (e.g. "1-00:00:00", "UNLIMITED", "NOT_SET")."""
+    text = run(["squeue", "-h", "-a", "-o", "%i|%j|%u|%t|%M|%l|%L|%N", "--states=R"])
     owner = {}
     for line in text.splitlines():
         if not line.strip():
             continue
-        jobid, jobname, user, st, elapsed, nodelist = line.split("|", 5)
+        jobid, jobname, user, st, elapsed, time_limit, time_left, nodelist = line.split("|", 7)
         if not nodelist:
             continue
         hosts = run(["scontrol", "show", "hostnames", nodelist],
@@ -138,7 +145,10 @@ def parse_jobs():
         for h in hosts:
             h = h.strip()
             if h:
-                owner[h] = (user, jobname, elapsed, jobid)
+                owner[h] = {
+                    "user": user, "jobname": jobname, "elapsed": elapsed, "jobid": jobid,
+                    "time_limit": time_limit, "time_left": time_left,
+                }
     return owner
 
 
@@ -183,6 +193,26 @@ def parse_pending():
                     "reason": reason, "waiting": waiting,
                 })
     return pending
+
+
+def compact_slurm_time(s):
+    """Compact a squeue %l/%L duration string ("7-00:00:00", "23:29:34",
+    "UNLIMITED", "NOT_SET") into a short form like "7d0h" / "23h29m"."""
+    if s in ("UNLIMITED", "NOT_SET", "INVALID"):
+        return s.lower()
+    days = 0
+    rest = s
+    if "-" in s:
+        days_str, rest = s.split("-", 1)
+        days = int(days_str)
+    parts = rest.split(":")
+    hours = int(parts[0]) if len(parts) > 0 else 0
+    minutes = int(parts[1]) if len(parts) > 1 else 0
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m"
 
 
 def natural_key(s):
@@ -291,25 +321,54 @@ def main():
     if not rows:
         print("(no machines matched)")
     else:
-        name_w = max(len(n["name"]) for n in rows) + 2
+        col_names = ["MACHINE", "STATE", "USER", "JOB", "ELAPSED", "JOBID", "LIMIT", "LEFT", "REASON"]
+        if args.show_partitions:
+            col_names.append("PARTITIONS")
+        if args.forge:
+            col_names.append("NOTE")
+        col_names.append("QUEUED")
+
+        cells = []
         for n in rows:
-            state_label = c(n["state"], f"{n['state']:<9}")
-            line = f"{n['name']:<{name_w}} {state_label}"
+            cell = {name: "" for name in col_names}
+            cell["MACHINE"] = n["name"]
+            cell["STATE"] = n["state"]
             if n["state"] == "BUSY" and n["name"] in owners:
-                user, jobname, elapsed, jobid = owners[n["name"]]
-                line += f" held by {user:<12} job={jobname:<12} for {elapsed:<12} (jobid {jobid})"
+                o = owners[n["name"]]
+                cell["USER"] = o["user"]
+                cell["JOB"] = truncate(o["jobname"], JOBNAME_MAX)
+                cell["ELAPSED"] = o["elapsed"]
+                cell["JOBID"] = f"#{o['jobid']}"
+                cell["LIMIT"] = compact_slurm_time(o["time_limit"])
+                cell["LEFT"] = compact_slurm_time(o["time_left"])
             elif n["state"] in ("DOWN", "DRAINING") and n["reason"]:
-                line += f" reason: {n['reason']}"
+                cell["REASON"] = n["reason"]
             if args.show_partitions:
-                line += f"  [{','.join(n['partitions'])}]"
+                cell["PARTITIONS"] = ",".join(n["partitions"])
+            if args.forge and n["name"] in FORGE_NOTES:
+                cell["NOTE"] = FORGE_NOTES[n["name"]]
             if n["name"] in pending:
                 jobs = pending[n["name"]]
                 first = jobs[0]
                 extra = f" (+{len(jobs) - 1} more)" if len(jobs) > 1 else ""
-                line += c("QUEUED", f"  QUEUED: {first['user']} waiting {first['waiting']}{extra}")
-            if args.forge and n["name"] in FORGE_NOTES:
-                line += f"  ({FORGE_NOTES[n['name']]})"
-            print(line)
+                cell["QUEUED"] = f"{first['user']} waiting {first['waiting']}{extra}"
+            cells.append(cell)
+
+        widths = {name: max(len(name), max((len(rc[name]) for rc in cells), default=0)) for name in col_names}
+
+        header = "  ".join(f"{name:<{widths[name]}}" for name in col_names)
+        print(c("BOLD", header.rstrip()))
+        for n, rc in zip(rows, cells):
+            parts = []
+            for name in col_names:
+                text = rc[name]
+                if name == "STATE":
+                    parts.append(c(n["state"], f"{text:<{widths[name]}}"))
+                elif name == "QUEUED" and text:
+                    parts.append(c("QUEUED", f"{text:<{widths[name]}}"))
+                else:
+                    parts.append(f"{text:<{widths[name]}}")
+            print("  ".join(parts).rstrip())
 
     if args.reserve is not None:
         print()

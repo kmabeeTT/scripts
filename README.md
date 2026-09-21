@@ -461,7 +461,7 @@ Distinct model names: 13
 ./slurm_free.py -v bh-lb                 # also print the underlying scontrol/squeue commands
 ```
 
-**Output**: One line per machine — name, state (`FREE`/`BUSY`/`DRAINING`/`DOWN`), and either who's holding it (user, job name, elapsed time) or the drain/down reason. Machines with a pending (`PD`) job explicitly requesting them are marked `QUEUED: user waiting Xh`. A summary line at top counts machines by state for the current filter.
+**Output**: A header-driven table, one row per machine: `MACHINE STATE USER JOB ELAPSED JOBID LIMIT LEFT REASON [PARTITIONS] [NOTE] QUEUED`. `LIMIT`/`LEFT` come from `squeue`'s `%l`/`%L` (that job's time budget and time remaining). `REASON` holds the drain/down reason for `DOWN`/`DRAINING` machines. `PARTITIONS` only appears with `-p`, `NOTE` only with `--forge`. `QUEUED` is always the last column and is only non-empty for machines with a pending (`PD`) job explicitly requesting them (`user waiting Xh`, `+N more` if several). Columns are padded to the widest value actually present in the current result set, so long usernames/job names (truncated at 22 chars) don't force width on every other run. A summary line at top counts machines by state for the current filter.
 
 **Use when**: You want to find an available machine for your team without memorizing `sinfo`/`squeue`/`scontrol` syntax, or want to check whether reserving a specific machine would put you behind someone else already queued for it.
 
@@ -477,10 +477,12 @@ Distinct model names: 13
 
 **Example**:
 ```bash
-$ ./slurm_free.py --forge -f
+$ ./slurm_free.py --forge
 Machines (20 match (forge team)): FREE: 1 | BUSY: 19
 
-bh-glx-120-c03u08   FREE       (14kW, 24h)
+MACHINE            STATE  USER       JOB               ELAPSED  JOBID    LIMIT  LEFT     REASON  NOTE         QUEUED
+bh-glx-120-c03u08  BUSY   mmanzoor   mmanzoor-prefill  17:29    #113258  1d0h   23h42m           14kW, 24h
+bh-glx-120-c01u14  FREE                                                                          8kW, 2AM-12PM ET
 
 $ ./slurm_free.py --reserve bh-glx-110-a09u14
 ...
