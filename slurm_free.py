@@ -15,6 +15,7 @@ Usage:
   slurm_free.py -f --reserve    # print an example salloc for a free match
   slurm_free.py --reserve HOST  # print an example salloc for a specific host
   slurm_free.py -q              # only show machines with a pending queue
+  slurm_free.py --forge --snipe # poll until a forge machine frees up, then grab it (prefers 14kW)
 """
 import argparse
 import os
@@ -22,6 +23,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 STATE_ORDER = ["FREE", "BUSY", "DRAINING", "DOWN", "OTHER"]
@@ -219,7 +221,91 @@ def natural_key(s):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
 
 
+def forge_priority(name):
+    """Lower sorts first. Prefers 14kW forge machines, then everything else."""
+    return 0 if "14kW" in FORGE_NOTES.get(name, "") else 1
+
+
+def snipe_loop(args, passes_filters, c):
+    """Poll until a machine matching passes_filters is FREE, then immediately
+    salloc --no-shell it (24h by default, job-name=<user>-prefill). Prefers
+    14kW forge machines when --forge is set. Runs until it lands one or the
+    user Ctrl-Cs."""
+    job_name = f"{os.environ.get('USER', 'me')}-prefill"
+    interval = args.snipe_interval
+    time_limit = args.snipe_time
+    skip = set()  # nodes we've given up on this run (bad partition, salloc error)
+    heartbeat_every = max(1, round(60 / interval))
+    tick = 0
+
+    print(c("BOLD", f"Sniping for a free machine{' (forge team)' if args.forge else ''}") +
+          f" -- polling every {interval}s, Ctrl-C to stop.\n")
+
+    try:
+        while True:
+            try:
+                nodes = parse_nodes()
+            except subprocess.CalledProcessError as e:
+                print(f"  error running slurm command: {e}", file=sys.stderr)
+                time.sleep(interval)
+                continue
+
+            candidates = [n for n in nodes.values()
+                          if passes_filters(n) and n["state"] == "FREE" and n["name"] not in skip]
+            if args.forge:
+                candidates.sort(key=lambda n: (forge_priority(n["name"]), natural_key(n["name"])))
+            else:
+                candidates.sort(key=lambda n: natural_key(n["name"]))
+
+            if candidates:
+                target = candidates[0]
+                name = target["name"]
+                partition = target["partitions"][0] if target["partitions"] else None
+                if not partition:
+                    print(f"  skipping {name}: no partition assigned")
+                    skip.add(name)
+                    continue
+
+                note = f" ({FORGE_NOTES[name]})" if args.forge and name in FORGE_NOTES else ""
+                print(f"  found free machine: {name}{note} -- reserving...")
+                cmd = ["salloc", "--no-shell", "-w", name, "-p", partition,
+                       f"--time={time_limit}", f"--job-name={job_name}"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"  salloc failed for {name}: {result.stderr.strip()}")
+                    skip.add(name)
+                    continue
+
+                time.sleep(2)  # let the scheduler settle, then confirm we actually landed it
+                check = subprocess.run(
+                    ["squeue", "-h", "-u", os.environ.get("USER", ""), "-w", name, "-o", "%i|%t"],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                if not check:
+                    print(f"  couldn't confirm allocation on {name}, retrying...")
+                    skip.add(name)
+                    continue
+                jobid, state = check.split("|", 1)
+                if state != "R":
+                    print(f"  lost the race for {name} (job {jobid} still {state}) -- "
+                          f"cancelling and retrying...")
+                    subprocess.run(["scancel", jobid], capture_output=True, text=True)
+                    continue
+
+                print(c("FREE", f"  reserved {name} -- jobid {jobid}, running, "
+                                 f"time={time_limit}, job-name={job_name}"))
+                return
+
+            tick += 1
+            if tick % heartbeat_every == 0:
+                print(f"  [{datetime.now().strftime('%H:%M:%S')}] still watching, nothing free yet...")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n  stopped.")
+
+
 def main():
+    sys.stdout.reconfigure(line_buffering=True)  # so --snipe's progress shows up when piped/logged
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pattern", nargs="?", default=None,
@@ -242,6 +328,14 @@ def main():
                           "match in the current results if no name given). Does not run anything.")
     ap.add_argument("-q", "--pending-only", action="store_true",
                      help="only show machines that have a pending (queued) request against them")
+    ap.add_argument("--snipe", action="store_true",
+                     help="poll (see --snipe-interval) until a machine matching the current "
+                          "filters is free, then immediately salloc --no-shell it (prefers 14kW "
+                          "machines with --forge). Runs until it lands one or you Ctrl-C.")
+    ap.add_argument("--snipe-interval", type=int, default=15, metavar="SECONDS",
+                     help="poll interval in seconds while sniping (default: 15)")
+    ap.add_argument("--snipe-time", default="24:00:00", metavar="TIME",
+                     help="--time value to request when sniping (default: 24:00:00)")
     args = ap.parse_args()
 
     global VERBOSE
@@ -254,17 +348,6 @@ def main():
             return text
         return f"{COLOR.get(state, '')}{text}{COLOR['RESET']}"
 
-    try:
-        nodes = parse_nodes()
-        owners = parse_jobs() if not args.free_only else {}
-        pending = parse_pending()
-    except subprocess.CalledProcessError as e:
-        print(f"error running slurm command: {e}", file=sys.stderr)
-        sys.exit(1)
-    except FileNotFoundError:
-        print("error: slurm commands (scontrol/squeue) not found on this host", file=sys.stderr)
-        sys.exit(1)
-
     rx = None
     if args.pattern:
         flags = re.IGNORECASE if args.ignore_case else 0
@@ -276,6 +359,21 @@ def main():
         if args.forge and n["name"] not in FORGE_MACHINES:
             return False
         return True
+
+    if args.snipe:
+        snipe_loop(args, passes_filters, c)
+        return
+
+    try:
+        nodes = parse_nodes()
+        owners = parse_jobs() if not args.free_only else {}
+        pending = parse_pending()
+    except subprocess.CalledProcessError as e:
+        print(f"error running slurm command: {e}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print("error: slurm commands (scontrol/squeue) not found on this host", file=sys.stderr)
+        sys.exit(1)
 
     rows = []
     for n in nodes.values():

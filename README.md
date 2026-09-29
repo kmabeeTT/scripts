@@ -459,6 +459,7 @@ Distinct model names: 13
 ./slurm_free.py -f --reserve             # example salloc command for a free match
 ./slurm_free.py --reserve bh-glx-b02u02  # example salloc command for a specific machine
 ./slurm_free.py -v bh-lb                 # also print the underlying scontrol/squeue commands
+./slurm_free.py --forge --snipe          # poll until a forge machine frees up, then grab it (prefers 14kW)
 ```
 
 **Output**: A header-driven table, one row per machine: `MACHINE STATE USER JOB ELAPSED JOBID LIMIT LEFT REASON [PARTITIONS] [NOTE] QUEUED`. `LIMIT`/`LEFT` come from `squeue`'s `%l`/`%L` (that job's time budget and time remaining). `REASON` holds the drain/down reason for `DOWN`/`DRAINING` machines. `PARTITIONS` only appears with `-p`, `NOTE` only with `--forge`. `QUEUED` is always the last column and is only non-empty for machines with a pending (`PD`) job explicitly requesting them (`user waiting Xh`, `+N more` if several). Columns are padded to the widest value actually present in the current result set, so long usernames/job names (truncated at 22 chars) don't force width on every other run. A summary line at top counts machines by state for the current filter.
@@ -474,6 +475,7 @@ Distinct model names: 13
 - `--reserve [MACHINE]` — print (don't run) an example `salloc` command for `MACHINE`, or the first free match if omitted; warns if anyone is already queued for it.
 - `-v/--show-commands` — print the actual `scontrol`/`squeue` commands as they run, so you can learn the raw slurm commands directly.
 - `--no-color` — disable ANSI colors (auto-disabled when piped).
+- `--snipe` — **actually reserves a machine** (unlike `--reserve`, which only prints an example). Polls (every `--snipe-interval` seconds, default 15) until a machine matching the current filters (pattern, `--forge`, etc.) is `FREE`, then immediately runs `salloc --no-shell -w <machine> -p <partition> --time=<--snipe-time, default 24:00:00> --job-name=<user>-prefill` on it. With `--forge`, prefers 14kW machines over 8kW ones; otherwise takes whichever free match sorts first. After sallocing, it confirms the job actually landed as `RUNNING` (not stuck behind someone else in `PD`) — if it lost the race, it `scancel`s the losing job and keeps polling. Runs until it lands one or you Ctrl-C. A node with no partition assigned is skipped for the rest of that run.
 
 **Example**:
 ```bash
