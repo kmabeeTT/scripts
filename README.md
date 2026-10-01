@@ -521,6 +521,22 @@ TT_MESH_SMOKE_INTERCONNECT=1 pytest tt_mesh_smoke.py -v -k interconnect
 
 **Note**: The default (liveness) mode is deliberately local-only — no CCL, no fabric — so it can't hang on topology. The `--interconnect` ladder does bring fabric up, and two things there are worth knowing: `TT_METAL_OPERATION_TIMEOUT_SECONDS` (set to 30s by the script) bounds *dispatch ops* only, **not** fabric bring-up — a fabric that can't route blocks forever inside `open_mesh_device`, and killing that is what wedges an ethernet core (recovery: `tt-smi -glx_reset`). And `FABRIC_1D` works on a BH Galaxy while `--ring` (`FABRIC_1D_RING`) hangs at bring-up, *even though* the physical grouping descriptor advertises `TORUSX/TORUSY/TORUSXY` matches — descriptor matching a torus does not mean the ring routes. The script auto-sets `TT_MESH_GRAPH_DESC_PATH` to `single_bh_galaxy_mesh_graph_descriptor.textproto` when unset (it must be exported before `import ttnn` to take effect). Needs `TT_METAL_HOME`, `PYTHONPATH`, and the tt-metal venv, same as any ttnn run.
 
+### 📡 tt_activity.py
+**When did someone last use the TT devices, and is anyone using them now? (works across users under hidepid)**
+
+```bash
+python3 tt_activity.py                # last-use report, then watch 1h polling every 30s
+python3 tt_activity.py --once         # report only
+python3 tt_activity.py -d 15m -i 10   # watch 15 min, 10s polls
+python3 tt_activity.py --ignore-me    # don't count your own jobs
+```
+
+**Output**: A short last-use report (in use now / last episode an earlier watch recorded / newest `/dev/shm` file per user / stale locks / chips written since boot), then one line when device activity starts and one when it stops (`21:41:10 ▶ started chips 0-31 (32) mmanzoor [lock, 4,210,334 words]`), a single in-place status line with a running timeline, and a summary with the full timeline (`·` idle, `▪` probe, `█` job), at the end or on Ctrl-C.
+
+**How it detects use**: the per-chip PCIe **write** counters in `/sys/class/tenstorrent/*/pcie_perf_counters` sit at exactly 0 on an idle chip, while the read counters tick from firmware telemetry. Any write delta counts: about 55 words per chip for a `tt-smi -s` ("probe", flagged in the output as likely `tt-smi -s` or a telemetry read), and 1e5+ for a real job. It also counts a held UMD `CHIP_IN_USE` lock (the holder's user comes from cgroup, as in `tt-devs.sh`) and aiclk > 900 MHz. Users are named only from the lock holder, so activity with no lock is `user unknown`.
+
+**Note**: Nothing on the box records when a device was last *closed*, so the startup report is only a bound: a `/dev/shm` mtime marks when a job started, not when it ended. Every episode a watch sees goes to `~/.cache/tt-activity/events.log`, and the next run's report shows the latest one as "Last seen by this tool". Episode times are accurate to ±one poll interval.
+
 ### 👀 pr_review_status.py
 **Which reviews is a PR actually still waiting on, and who can clear them**
 
