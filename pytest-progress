@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Progress of a pytest run from its log, live or finished.
+
+    pytest-progress LOG            one-shot report
+    pytest-progress LOG -w 30      refresh every 30 s (Ctrl-C to stop)
+    pytest-progress LOG --fails    also list every failure so far
+
+Works with verbose output (-v / pytest.ini addopts), where the node id and its PASSED/FAILED land on separate lines
+with device logs in between, and with the final summary (`N failed, M passed ... in Xs`). Elapsed and per-test times
+come from the timestamps the run prints (loguru `YYYY-MM-DD HH:MM:SS`), and fall back to the file's mtime.
+"""
+import argparse
+import os
+import re
+import sys
+import time
+from datetime import datetime
+
+OUTCOMES = ("PASSED", "FAILED", "SKIPPED", "ERROR", "XFAIL", "XPASS")
+NODE_RE = re.compile(r"((?:[\w./-]+\.py)::[^\s]+)")
+OUT_RE = re.compile(r"(?:^|\s)(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)(?=\s|$|\x1b|\[| \()")
+TS_RE = re.compile(r"(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)")
+SUMMARY_RE = re.compile(r"=+ (.*\b(?:passed|failed|error|errors|skipped|deselected)\b.* in [\d.]+s.*?) =+")
+COLLECTED_RE = re.compile(r"collected (\d+) items?(?: / (\d+) deselected)?")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def ts(s):
+    m = TS_RE.search(s)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def fmt(sec):
+    if sec is None:
+        return "?"
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def analyse(path):
+    counts = {k: 0 for k in OUTCOMES}
+    collected = deselected = None
+    first_ts = last_ts = None
+    current = None          # node id whose outcome hasn't printed yet
+    current_start = None
+    last_node = None
+    fails = []
+    summary = None
+    with open(path, errors="replace") as f:
+        for raw in f:
+            line = ANSI.sub("", raw.rstrip("\n"))
+            t = ts(line)
+            if t:
+                first_ts = first_ts or t
+                last_ts = t
+            m = COLLECTED_RE.search(line)
+            if m:
+                collected = int(m.group(1))
+                deselected = int(m.group(2)) if m.group(2) else None
+            m = SUMMARY_RE.search(line)
+            if m and " in " in m.group(1):
+                summary = m.group(1).strip()
+            if (line.startswith(("FAILED ", "ERROR ")) and "::" in line) or re.match(r"(SKIPPED|XFAIL|XPASS) \[\d+\]", line):
+                continue  # final -rfEs short summary; counted from the per-test outcomes
+            node = NODE_RE.search(line)
+            if node and not line.lstrip().startswith(("FAILED", "ERROR", "PASSED", "SKIPPED")):
+                if node.group(1) != current:
+                    current, current_start, last_node = node.group(1), (t or current_start), node.group(1)
+            o = OUT_RE.search(line)
+            if o and (node or line.strip() in OUTCOMES or line.strip().startswith(OUTCOMES)):
+                k = o.group(1)
+                counts[k] += 1
+                if k in ("FAILED", "ERROR"):
+                    fails.append((node.group(1) if node else last_node) or "?")
+                current, current_start = None, None
+    return dict(counts=counts, collected=collected, deselected=deselected, first_ts=first_ts, last_ts=last_ts,
+                current=current, current_start=current_start, fails=fails, summary=summary)
+
+
+def report(path, show_fails):
+    a = analyse(path)
+    c = a["counts"]
+    done = sum(c.values())
+    total = a["collected"] - (a["deselected"] or 0) if a["collected"] else None
+    now = time.time()
+    mtime = os.path.getmtime(path)
+    start = a["first_ts"] or os.path.getctime(path)
+    finished = a["summary"] is not None
+    end = (a["last_ts"] or mtime) if finished else now
+    elapsed = end - start
+    out = [f"log      {path}"]
+    out.append("status   " + ("FINISHED: " + a["summary"] if finished else f"running (log written {fmt(now - mtime)} ago)"))
+    pct = f" ({100 * done / total:.1f}%)" if total else ""
+    out.append(f"progress {done}/{total if total else '?'}{pct}")
+    out.append("results  " + "  ".join(f"{k.lower()} {v}" for k, v in c.items() if v or k in ("PASSED", "FAILED", "SKIPPED")))
+    out.append(f"elapsed  {fmt(elapsed)}")
+    if not finished:
+        ran = c["PASSED"] + c["FAILED"] + c["ERROR"] + c["XFAIL"] + c["XPASS"]
+        if total and done:
+            # skips are near-instant, so pace the ETA on tests that ran
+            remaining = total - done
+            rate = elapsed / max(done, 1)
+            out.append(f"eta      ~{fmt(remaining * rate)} at the average pace so far (skips make this rough)")
+        if a["current"]:
+            name = a["current"].split("::", 1)[-1]
+            since = (now - a["current_start"]) if a["current_start"] else None
+            out.append(f"current  {name}  (running {fmt(since)})")
+    if c["FAILED"] or c["ERROR"]:
+        names = [n.split("::", 1)[-1] for n in a["fails"]]
+        out.append(f"failures {len(names)}" + (":" if show_fails or len(names) <= 10 else " (use --fails for all)"))
+        for n in (names if show_fails else names[:10]):
+            out.append(f"  - {n}")
+    return "\n".join(out)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("log")
+    p.add_argument("-w", "--watch", type=int, metavar="SEC", help="refresh every SEC seconds")
+    p.add_argument("--fails", action="store_true", help="list every failure")
+    a = p.parse_args()
+    if not os.path.exists(a.log):
+        sys.exit(f"no such log: {a.log}")
+    if not a.watch:
+        print(report(a.log, a.fails))
+        return
+    try:
+        while True:
+            r = report(a.log, a.fails)
+            print("\x1b[2J\x1b[H" + time.strftime("%H:%M:%S ") + "(Ctrl-C to stop)\n" + r, flush=True)
+            if r.split("\n")[1].startswith("status   FINISHED"):
+                break
+            time.sleep(a.watch)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

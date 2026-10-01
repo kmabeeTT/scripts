@@ -571,6 +571,33 @@ further back for a low-traffic team's approvers.
 interactively; this script is the standalone equivalent for anyone not using Claude Code,
 or for piping into other tooling.
 
+
+### ⏱️ pytest-progress
+**How far along is a long pytest run, and what is it doing right now**
+
+```bash
+pytest-progress /path/to/run.log            # one-shot report, live or finished
+pytest-progress /path/to/run.log -w 30      # refresh every 30 s; exits when the run finishes
+pytest-progress /path/to/run.log --fails    # list every failure (default shows the first 10)
+```
+
+**Output** (a live whole-file `test_ring_joint_sdpa.py` run):
+```
+status   running (log written 1m54s ago)
+progress 136/259 (52.5%)
+results  passed 64  failed 0  skipped 72
+elapsed  55m45s
+eta      ~50m25s at the average pace so far (skips make this rough)
+current  test_ring_mla_determinism[ring_mla-mla_100k-q160-k320]  (running 2m01s)
+```
+A finished log shows `status FINISHED: <pytest's summary line>` and the failure names in order.
+
+**Use when**: a multi-hour device run writes a log you can't skim. With `-v` (or tt-metal's `pytest.ini` addopts) each node id and its `PASSED` / `FAILED` land on separate lines with thousands of device-log lines in between, and the full `FAILED ...` list only appears at the very end.
+
+**How it works**: counts per-test outcomes, ignoring the `-rfEs` short summary (`FAILED tests/...`, `SKIPPED [n] file:line`) so nothing is double-counted. The total comes from `collected N items` minus deselected. Elapsed and the current test's age come from the loguru timestamps the run prints. The "log written N ago" line tells a quiet-but-busy test from a hang. Checked against three finished logs: its counts equal pytest's own summary.
+
+**Note**: plain `-q` dot output (`....F.s`) isn't parsed; the per-test lines need `-v`. The ETA is rough, since skips finish almost instantly.
+
 ---
 
 ---
