@@ -198,23 +198,32 @@ def parse_pending():
 
 
 def compact_slurm_time(s):
-    """Compact a squeue %l/%L duration string ("7-00:00:00", "23:29:34",
-    "UNLIMITED", "NOT_SET") into a short form like "7d0h" / "23h29m"."""
+    """Compact a squeue %l/%L duration string into a short form like "7d0h" /
+    "23h29m" / "49m". Slurm uses adaptive precision depending on magnitude:
+    "SS" (<1min), "MM:SS" (<1hr), "HH:MM:SS" (<1day), "D-HH:MM:SS" (>=1day),
+    plus the special values UNLIMITED/NOT_SET/INVALID. A bare two-part
+    colon string is MM:SS, NOT a truncated HH:MM -- misreading it as hours
+    turns e.g. "49:53" (49 minutes left) into a fictional "49h53m"."""
     if s in ("UNLIMITED", "NOT_SET", "INVALID"):
         return s.lower()
-    days = 0
-    rest = s
-    if "-" in s:
-        days_str, rest = s.split("-", 1)
-        days = int(days_str)
-    parts = rest.split(":")
-    hours = int(parts[0]) if len(parts) > 0 else 0
-    minutes = int(parts[1]) if len(parts) > 1 else 0
-    if days:
-        return f"{days}d{hours}h"
-    if hours:
-        return f"{hours}h{minutes}m"
-    return f"{minutes}m"
+    try:
+        days = 0
+        rest = s
+        if "-" in s:
+            days_str, rest = s.split("-", 1)
+            days = int(days_str)
+        parts = rest.split(":")
+        if days:
+            hours = int(parts[0]) if parts else 0
+            return f"{days}d{hours}h"
+        if len(parts) == 3:
+            hours, minutes = int(parts[0]), int(parts[1])
+            return f"{hours}h{minutes}m" if hours else f"{minutes}m"
+        if len(parts) == 2:
+            return f"{int(parts[0])}m"
+        return "<1m"
+    except (ValueError, IndexError):
+        return s
 
 
 def natural_key(s):
